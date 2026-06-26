@@ -51,6 +51,25 @@ w.Close()
 
 Same `Writer[T]` surface either way; swap via `WithEncoder(roost.NewDuckDBEncoder(...))`.
 
+## Performance
+
+```
+goos: darwin
+goarch: arm64
+pkg: github.com/jayjamieson/roost
+cpu: Apple M5
+BenchmarkAppend-10                               4722384               251.0 ns/op          2019 B/op          8 allocs/op
+BenchmarkAppendAndRoll-10                        3871932               317.8 ns/op        327.22 MB/s        3867 B/op          8 allocs/op
+BenchmarkRollConcurrency/workers=1-10            1147006               1031 ns/op         100.87 MB/s        3855 B/op          8 allocs/op
+BenchmarkRollConcurrency/workers=4-10            4402430               247.5 ns/op        420.29 MB/s        3874 B/op          8 allocs/op
+BenchmarkRollConcurrency/workers=16-10          11206383               104.8 ns/op        991.92 MB/s        3855 B/op          8 allocs/op
+BenchmarkRollConcurrency/workers=32-10          11164981               110.3 ns/op        942.71 MB/s        3853 B/op          8 allocs/op
+BenchmarkRollConcurrencyMem/workers=1-10         1180226               996.5 ns/op              89.01 deltaMB           90.00 peakMB        3893 B/op        8 allocs/op
+BenchmarkRollConcurrencyMem/workers=4-10         4608975               231.9 ns/op             346.7 deltaMB           347.7 peakMB         3869 B/op        8 allocs/op
+BenchmarkRollConcurrencyMem/workers=16-10        9727112               123.9 ns/op             205.2 deltaMB           206.2 peakMB         3852 B/op        8 allocs/op
+BenchmarkRollConcurrencyMem/workers=32-10        9677396               126.5 ns/op             224.7 deltaMB           225.8 peakMB         3852 B/op        8 allocs/op
+```
+
 ## S3/R2 sink: single PUT, no multipart
 
 The sink buffers each object to a spill temp file, then issues one
