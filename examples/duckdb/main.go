@@ -1,4 +1,4 @@
-//go:build duckdb
+//go:build duckdb_arrow
 
 // Command duckdb-example uses the DuckDB encoder (CGO + libduckdb).
 // Run: go run -tags duckdb ./examples/duckdb
