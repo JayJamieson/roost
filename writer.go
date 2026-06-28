@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/memory"
@@ -65,7 +66,7 @@ func NewWriter[T any](ctx context.Context, sink Sink, opts ...Option) (*Writer[T
 	if cfg.encoder != nil {
 		w.enc = cfg.encoder
 	} else {
-		w.enc = NewPqarrowEncoder(cfg.codec, cfg.rowGroupRows)
+		w.enc = NewPqarrowEncoder(cfg.codec, cfg.rowGroupRows, unionDictCols(pl.dictCols, cfg.dictColumns)...)
 	}
 	if cfg.concurrency > 1 {
 		w.pool = newEncodePool(cfg.concurrency, w.runJob)
@@ -73,7 +74,9 @@ func NewWriter[T any](ctx context.Context, sink Sink, opts ...Option) (*Writer[T
 	return w, nil
 }
 
-// Append writes one record. Cheap path only: reflect, route, buffer.
+// Append writes one record via the value-reflection strategy: it boxes v into
+// an interface for reflect, which costs one heap allocation per row. See
+// AppendPtr and AppendUnsafe for allocation-free alternatives.
 func (w *Writer[T]) Append(v T) error {
 	rv := reflect.ValueOf(v)
 	for rv.Kind() == reflect.Pointer {
@@ -87,23 +90,91 @@ func (w *Writer[T]) Append(v T) error {
 	if w.closed {
 		return errClosed
 	}
+	ps, err := w.getPartLocked(partitionPath(rv, w.pl.partCols))
+	if err != nil {
+		return err
+	}
+	ps.app.appendRow(rv)
+	return w.postAppendLocked(ps)
+}
 
-	key := partitionPath(rv, w.pl.partCols)
+// AppendPtr is like Append but takes a pointer. Boxing a pointer into reflect's
+// interface does not allocate, and .Elem() yields an addressable Value into the
+// caller's storage, so a caller holding addressable data (e.g. &slice[i]) pays
+// no per-row allocation. Field reads still go through reflection.
+func (w *Writer[T]) AppendPtr(v *T) error {
+	if v == nil {
+		return errNil
+	}
+	rv := reflect.ValueOf(v).Elem()
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return errClosed
+	}
+	ps, err := w.getPartLocked(partitionPath(rv, w.pl.partCols))
+	if err != nil {
+		return err
+	}
+	ps.app.appendRow(rv)
+	return w.postAppendLocked(ps)
+}
+
+// AppendUnsafe is like Append but reads fields through precomputed byte offsets
+// (computed once from the compiler's struct layout) instead of reflection on the
+// hot path. It is the fastest strategy in CPU terms because it does no reflect
+// work per field and never boxes time.Time.
+//
+// It does NOT, however, eliminate the per-row allocation: &v is taken and the
+// resulting pointer flows into appendRowUnsafe, whose per-field accessor is an
+// indirect closure call, so escape analysis conservatively moves v to the heap.
+// In other words it trades the value strategy's reflect-boxing allocation for an
+// argument-escape allocation of the same struct. If allocation count is the
+// priority, AppendPtr allocates the fewest bytes (see BenchmarkAppendStrategies).
+//
+// Safety: offsets come from reflect.StructField.Offset for this exact T; field
+// pointers are derived with unsafe.Add (never uintptr arithmetic) so the GC
+// tracks them; every read is immediately copied into the builder, so nothing
+// aliases v after the call. The equivalence and value tests run under
+// `go test -race`, which enables checkptr to validate the pointer arithmetic.
+func (w *Writer[T]) AppendUnsafe(v T) error {
+	base := unsafe.Pointer(&v)
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return errClosed
+	}
+	ps, err := w.getPartLocked(partitionPathUnsafe(base, w.pl.partCols))
+	if err != nil {
+		return err
+	}
+	ps.app.appendRowUnsafe(base)
+	return w.postAppendLocked(ps)
+}
+
+// getPartLocked returns the partState for key, creating and (if necessary)
+// evicting to make room. Caller holds w.mu. Takes no closures so all three
+// Append variants share routing without incurring an allocation.
+func (w *Writer[T]) getPartLocked(key string) (*partState, error) {
 	ps := w.parts[key]
 	if ps == nil {
 		if err := w.evictIfNeeded(); err != nil {
-			return err
+			return nil, err
 		}
 		ps = &partState{pathSeg: key, app: newAppender(w.mem, w.pl.fileSchema, w.pl.dataCols)}
 		w.parts[key] = ps
 	}
 	w.touch(key)
+	return ps, nil
+}
 
-	ps.app.appendRow(rv)
+// postAppendLocked records one buffered row, snapshots a record at the row-group
+// boundary, and rolls the object when it reaches its size limit. Caller holds
+// w.mu and has already appended the row to ps.app.
+func (w *Writer[T]) postAppendLocked(ps *partState) error {
 	ps.objRows++
 	ps.objBytes += w.rowBytesEstimate()
 	w.stats.addRows(1)
-
 	if int64(ps.app.rows) >= w.cfg.rowGroupRows {
 		ps.recs = append(ps.recs, ps.app.newRecord())
 	}
@@ -236,6 +307,29 @@ func (w *Writer[T]) evictIfNeeded() error {
 	err := w.finalizeLocked(ps)
 	ps.app.release()
 	return err
+}
+
+// unionDictCols merges the tag-derived and option-derived dictionary column
+// lists, de-duplicating while keeping a stable order (tag columns first).
+func unionDictCols(tag, opt []string) []string {
+	if len(tag) == 0 && len(opt) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(tag)+len(opt))
+	out := make([]string, 0, len(tag)+len(opt))
+	for _, c := range tag {
+		if _, ok := seen[c]; !ok {
+			seen[c] = struct{}{}
+			out = append(out, c)
+		}
+	}
+	for _, c := range opt {
+		if _, ok := seen[c]; !ok {
+			seen[c] = struct{}{}
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 func releaseRecs(recs []arrow.RecordBatch) {

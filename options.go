@@ -9,6 +9,7 @@ type config struct {
 	maxOpenPartitions int
 	concurrency       int
 	encoder           Encoder
+	dictColumns       []string // columns to dictionary-encode (default: none)
 }
 
 func defaultConfig() config {
@@ -48,3 +49,18 @@ func WithEncodeConcurrency(n int) Option { return func(o *config) { o.concurrenc
 
 // WithEncoder overrides the encoder (e.g. the DuckDB encoder).
 func WithEncoder(e Encoder) Option { return func(o *config) { o.encoder = e } }
+
+// WithDictionaryColumns enables Parquet dictionary encoding for the named
+// columns (by their Parquet name, i.e. the name= tag value or field name). It is
+// unioned with any columns carrying the `dict` struct tag.
+//
+// Dictionary encoding shrinks low-cardinality, repetitive columns (enums, status
+// codes, region names) and often speeds them up. Leave it off — the default —
+// for high-cardinality or unique columns (IDs, timestamps, random/binary blobs):
+// there it only burns memory and CPU building a dictionary that never pays off.
+//
+// Only the default pqarrow encoder honors this; a custom WithEncoder is
+// responsible for its own encoding choices.
+func WithDictionaryColumns(cols ...string) Option {
+	return func(o *config) { o.dictColumns = append(o.dictColumns, cols...) }
+}

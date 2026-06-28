@@ -12,13 +12,20 @@ import (
 
 type pqEncoder struct{ props *parquet.WriterProperties }
 
-// NewPqarrowEncoder returns the pure-Go default encoder.
-func NewPqarrowEncoder(codec string, rowGroupRows int64) Encoder {
-	return &pqEncoder{props: parquet.NewWriterProperties(
+// NewPqarrowEncoder returns the pure-Go default encoder. Dictionary encoding is
+// off by default and enabled only for the columns in dictCols (see
+// WithDictionaryColumns and the `dict` struct tag), so high-cardinality columns
+// don't pay for a dictionary that never compresses.
+func NewPqarrowEncoder(codec string, rowGroupRows int64, dictCols ...string) Encoder {
+	props := []parquet.WriterProperty{
 		parquet.WithCompression(pqCodec(codec)),
 		parquet.WithMaxRowGroupLength(rowGroupRows),
-		parquet.WithDictionaryDefault(true),
-	)}
+		parquet.WithDictionaryDefault(false),
+	}
+	for _, c := range dictCols {
+		props = append(props, parquet.WithDictionaryFor(c, true))
+	}
+	return &pqEncoder{props: parquet.NewWriterProperties(props...)}
 }
 
 func (e *pqEncoder) EncodeObject(_ context.Context, dst io.Writer, schema *arrow.Schema, recs []arrow.RecordBatch) error {
