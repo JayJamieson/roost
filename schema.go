@@ -29,6 +29,7 @@ type plan struct {
 	fileSchema *arrow.Schema // excludes partition columns (Hive convention)
 	dataCols   []fieldPlan   // order matches fileSchema fields
 	partCols   []fieldPlan
+	dictCols   []string // data column names tagged for dictionary encoding
 }
 
 func buildPlan(t reflect.Type) (*plan, error) {
@@ -40,12 +41,13 @@ func buildPlan(t reflect.Type) (*plan, error) {
 	}
 	var data, parts []fieldPlan
 	var fields []arrow.Field
+	var dictCols []string
 	for i := 0; i < t.NumField(); i++ {
 		sf := t.Field(i)
 		if sf.PkgPath != "" {
 			continue // unexported
 		}
-		name, partition, omit := parseTag(sf)
+		name, partition, omit, dict := parseTag(sf)
 		if omit {
 			continue
 		}
@@ -63,18 +65,21 @@ func buildPlan(t reflect.Type) (*plan, error) {
 		}
 		data = append(data, fp)
 		fields = append(fields, arrow.Field{Name: name, Type: dt, Nullable: nullable})
+		if dict {
+			dictCols = append(dictCols, name)
+		}
 	}
 	if len(data) == 0 {
 		return nil, fmt.Errorf("roost: struct %s has no data columns", t)
 	}
-	return &plan{fileSchema: arrow.NewSchema(fields, nil), dataCols: data, partCols: parts}, nil
+	return &plan{fileSchema: arrow.NewSchema(fields, nil), dataCols: data, partCols: parts, dictCols: dictCols}, nil
 }
 
-func parseTag(sf reflect.StructField) (name string, partition, omit bool) {
+func parseTag(sf reflect.StructField) (name string, partition, omit, dict bool) {
 	name = sf.Name
 	tag := sf.Tag.Get("roost")
 	if tag == "" {
-		return name, false, false
+		return name, false, false, false
 	}
 	for _, p := range strings.Split(tag, ",") {
 		p = strings.TrimSpace(p)
@@ -83,11 +88,13 @@ func parseTag(sf reflect.StructField) (name string, partition, omit bool) {
 			omit = true
 		case p == "partition":
 			partition = true
+		case p == "dict":
+			dict = true
 		case strings.HasPrefix(p, "name="):
 			name = strings.TrimPrefix(p, "name=")
 		}
 	}
-	return name, partition, omit
+	return name, partition, omit, dict
 }
 
 // elem dereferences a pointer field, reporting ok=false for a nil pointer.

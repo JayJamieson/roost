@@ -1,51 +1,72 @@
 package roost
 
 import (
-	"sync"
+	"io"
 
 	"github.com/apache/arrow-go/v18/arrow"
 )
 
-type encodeJob struct {
-	name string
-	recs []arrow.RecordBatch
+// objState is the per-object encode state shared by all of an object's ops. All
+// ops for one object are routed to a single worker (affinity), so failed is only
+// ever touched by that one goroutine — no synchronization needed.
+type objState struct {
+	obj    ObjectEncoder
+	wc     io.WriteCloser
+	cw     *countWriter
+	failed bool
 }
 
-// encodePool runs encode+upload jobs on N workers so Append doesn't block.
-type encodePool struct {
-	jobs chan encodeJob
-	run  func(encodeJob) error
-	wg   sync.WaitGroup
-	mu   sync.Mutex
-	err  error
+// encodeOp is one unit of work for an encode worker: write rec as a row group,
+// or, when rec is nil, finalize the object (footer + upload).
+type encodeOp struct {
+	os  *objState
+	rec arrow.RecordBatch
 }
 
-func newEncodePool(n int, run func(encodeJob) error) *encodePool {
-	p := &encodePool{jobs: make(chan encodeJob, n*2), run: run}
-	for i := 0; i < n; i++ {
-		p.wg.Add(1)
-		go p.worker()
-	}
-	return p
-}
-
-func (p *encodePool) worker() {
-	defer p.wg.Done()
-	for j := range p.jobs {
-		if err := p.run(j); err != nil {
-			p.mu.Lock()
-			if p.err == nil {
-				p.err = err
+// encodeWorker drains one worker channel. A fixed set of these (sized by
+// WithEncodeConcurrency) does all compression and upload off the Writer's lock,
+// so the goroutine count is bounded regardless of how many objects churn. Each
+// object is pinned to one worker, so its row groups are written in order.
+func (w *Writer[T]) encodeWorker(ch <-chan encodeOp) {
+	defer w.wg.Done()
+	for op := range ch {
+		os := op.os
+		if op.rec != nil {
+			if !os.failed {
+				if err := os.obj.Write(op.rec); err != nil {
+					os.failed = true
+					w.setEncErr(err)
+				}
 			}
-			p.mu.Unlock()
+			op.rec.Release()
+			continue
+		}
+		// rec == nil: finalize.
+		if err := os.obj.Close(); err != nil && !os.failed {
+			os.failed = true
+			w.setEncErr(err)
+		}
+		if !os.failed {
+			w.stats.addObject(os.cw.n)
+		}
+		if err := os.wc.Close(); err != nil {
+			w.setEncErr(err)
 		}
 	}
 }
 
-func (p *encodePool) submit(j encodeJob) { p.jobs <- j }
+// setEncErr records the first error seen by any encode worker.
+func (w *Writer[T]) setEncErr(err error) {
+	w.encMu.Lock()
+	if w.encErr == nil {
+		w.encErr = err
+	}
+	w.encMu.Unlock()
+}
 
-func (p *encodePool) close() error {
-	close(p.jobs)
-	p.wg.Wait()
-	return p.err
+// encErrLoad returns the first encode error seen so far, if any.
+func (w *Writer[T]) encErrLoad() error {
+	w.encMu.Lock()
+	defer w.encMu.Unlock()
+	return w.encErr
 }
