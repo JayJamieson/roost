@@ -3,7 +3,7 @@
 // DuckDB encoder: buffers an object's records (DuckDB's COPY consumes the whole
 // set at once), then registers them as a view and COPYs to a temp Parquet file
 // using DuckDB's C++ writer, streaming the result to dst on Close. Unlike the
-// pqarrow encoder this holds the records until Close — that buffering is a
+// pqarrow encoder this holds the records until Close - that buffering is a
 // DuckDB constraint. Build with -tags duckdb; needs CGO + go-duckdb/v2.
 package roost
 

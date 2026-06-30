@@ -13,7 +13,7 @@ import (
 
 // Example shows the two constructors side by side: NewWriter uses reflection
 // (zero setup), NewWriterFor uses the roostgen-emitted appender (zero
-// reflection). Everything else — options, sinks, encoders, partitioning — is
+// reflection). Everything else - options, sinks, encoders, partitioning - is
 // identical, so switching is just changing the constructor.
 func Example() {
 	ctx := context.Background()

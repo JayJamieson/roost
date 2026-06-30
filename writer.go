@@ -20,15 +20,17 @@ var (
 
 // Writer encodes a stream of T into Parquet objects via a Sink.
 type Writer[T any] struct {
-	ctx    context.Context
-	sink   Sink
-	enc    Encoder
-	mem    memory.Allocator
-	app    RowAppender[T]
-	schema *arrow.Schema // == app.Schema(), cached
-	tPtr   bool          // T is a pointer type; needs a per-row nil guard
-	cfg    config
-	runID  int64
+	ctx     context.Context
+	sink    Sink
+	enc     Encoder
+	mem     memory.Allocator
+	app     RowAppender[T]
+	partApp PartitionAppender[T] // non-nil when app builds keys into a buffer
+	scratch []byte               // reused partition-key buffer (guarded by mu)
+	schema  *arrow.Schema        // == app.Schema(), cached
+	tPtr    bool                 // T is a pointer type; needs a per-row nil guard
+	cfg     config
+	runID   int64
 
 	mu     sync.Mutex
 	parts  map[string]*partState
@@ -80,8 +82,8 @@ func NewWriter[T any](ctx context.Context, sink Sink, opts ...Option) (*Writer[T
 }
 
 // NewWriterFor is the zero-reflection path: a is typically a roostgen-emitted
-// appender (e.g. MetricRoostAppender{}). Everything else — options, sinks,
-// encoders, partitioning — is identical to NewWriter. Because T is only present
+// appender (e.g. MetricRoostAppender{}). Everything else - options, sinks,
+// encoders, partitioning - is identical to NewWriter. Because T is only present
 // through the interface argument, callers usually need the explicit type
 // argument: roost.NewWriterFor[Metric](ctx, sink, MetricRoostAppender{}).
 //
@@ -116,6 +118,11 @@ func newWriter[T any](ctx context.Context, sink Sink, app RowAppender[T], schema
 		tPtr:  reflect.TypeOf((*T)(nil)).Elem().Kind() == reflect.Pointer,
 		runID: time.Now().UnixNano(), parts: make(map[string]*partState),
 	}
+	// Opt into the zero-allocation partition-key path when the appender supports
+	// it (roostgen emits PartitionInto for partitioned types).
+	if pa, ok := app.(PartitionAppender[T]); ok {
+		w.partApp = pa
+	}
 	if cfg.encoder != nil {
 		w.enc = cfg.encoder
 	} else {
@@ -140,13 +147,25 @@ func newWriter[T any](ctx context.Context, sink Sink, app RowAppender[T], schema
 	return w
 }
 
-// Append writes one record. Cheap path: route to a partition, append to
-// builders via the RowAppender, and flush a row group through the open encoder
-// when one fills. The generated RowAppender does this with zero reflection.
-func (w *Writer[T]) Append(v T) error {
+// Append writes one record by value. It delegates to AppendPtr; because it
+// takes the address of its value parameter, that row escapes to the heap (one
+// allocation per call). Hot paths that want to avoid it should reuse a row
+// buffer and call AppendPtr.
+func (w *Writer[T]) Append(v T) error { return w.AppendPtr(&v) }
+
+// AppendPtr writes one record through a pointer. A caller that reuses a single
+// row buffer across calls pays no per-row heap copy - the pointer's escape is
+// hoisted out of the caller's loop - unlike Append(v T), which copies its value
+// parameter to the heap every call. The Writer reads *v synchronously under its
+// lock and never retains it, so reusing the buffer between calls is safe. v must
+// be non-nil.
+func (w *Writer[T]) AppendPtr(v *T) error {
+	if v == nil {
+		return errNil
+	}
 	// Only pointer-typed T needs the nil guard, and only then do we pay for a
 	// reflect call; value structs (and all generated appenders) skip it entirely.
-	if w.tPtr && nilPointer(v) {
+	if w.tPtr && nilPointer(*v) {
 		return errNil
 	}
 	w.mu.Lock()
@@ -155,18 +174,13 @@ func (w *Writer[T]) Append(v T) error {
 		return errClosed
 	}
 
-	key := w.app.Partition(&v)
-	ps := w.parts[key]
-	if ps == nil {
-		if err := w.evictIfNeeded(); err != nil {
-			return err
-		}
-		ps = &partState{pathSeg: key, buf: newRecordBuf(w.mem, w.schema)}
-		w.parts[key] = ps
+	ps, err := w.partitionFor(v)
+	if err != nil {
+		return err
 	}
-	w.touch(key)
+	w.touch(ps.pathSeg) // ps.pathSeg is an owned string, so no per-row key alloc
 
-	w.app.Append(&v, ps.buf.b)
+	w.app.Append(v, ps.buf.b)
 	ps.buf.rows++
 	ps.objRows++
 	ps.objBytes += w.rowBytesEstimate()
@@ -183,6 +197,39 @@ func (w *Writer[T]) Append(v T) error {
 		return w.finalizeLocked(ps)
 	}
 	return nil
+}
+
+// partitionFor locates (or opens) the partState for v. Caller holds w.mu.
+//
+// With a PartitionAppender it builds the key into the reused scratch buffer and
+// looks it up via map[string(scratch)], which the compiler resolves without
+// allocating; a fresh key string is materialized only when a new partition is
+// opened. Without one it falls back to Partition(v)'s freshly allocated string.
+func (w *Writer[T]) partitionFor(v *T) (*partState, error) {
+	if w.partApp != nil {
+		w.scratch = w.partApp.PartitionInto(v, w.scratch[:0])
+		if ps := w.parts[string(w.scratch)]; ps != nil { // no allocation
+			return ps, nil
+		}
+		if err := w.evictIfNeeded(); err != nil {
+			return nil, err
+		}
+		key := string(w.scratch) // materialize only for a new partition
+		ps := &partState{pathSeg: key, buf: newRecordBuf(w.mem, w.schema)}
+		w.parts[key] = ps
+		return ps, nil
+	}
+
+	key := w.app.Partition(v)
+	if ps := w.parts[key]; ps != nil {
+		return ps, nil
+	}
+	if err := w.evictIfNeeded(); err != nil {
+		return nil, err
+	}
+	ps := &partState{pathSeg: key, buf: newRecordBuf(w.mem, w.schema)}
+	w.parts[key] = ps
+	return ps, nil
 }
 
 // Flush finalizes every open object, starting fresh objects afterward.

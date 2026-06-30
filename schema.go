@@ -99,6 +99,26 @@ func SanitizeSegment(s string) string {
 	}, s)
 }
 
+// AppendSanitized appends SanitizeSegment(s) to dst and returns the extended
+// slice, without allocating an intermediate string. Generated PartitionInto
+// methods use it to build partition keys into a reused buffer. All sanitized
+// characters are single-byte ASCII and every other byte is copied verbatim, so
+// the result is byte-identical to SanitizeSegment(s) (asserted by test).
+func AppendSanitized(dst []byte, s string) []byte {
+	if s == "" {
+		return append(dst, "__empty__"...)
+	}
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '/', '\\', '=', ' ', '\t', '\n', '\r', '"', '\'':
+			dst = append(dst, '_')
+		default:
+			dst = append(dst, s[i])
+		}
+	}
+	return dst
+}
+
 // elem dereferences a pointer field, reporting ok=false for a nil pointer.
 func elem(fv reflect.Value) (reflect.Value, bool) {
 	if fv.Kind() == reflect.Pointer {

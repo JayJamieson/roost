@@ -26,9 +26,23 @@ type RowAppender[T any] interface {
 	Append(v *T, b *array.RecordBuilder)
 }
 
+// PartitionAppender is an optional optimization a RowAppender may also implement
+// (roostgen emits it for partitioned types). When the Writer sees it, it builds
+// the partition key into a reused scratch buffer via PartitionInto instead of
+// allocating a fresh string from Partition every row, so a steady stream into
+// already-open partitions appends with zero allocations.
+//
+// PartitionInto MUST append to dst and return the extended slice (append-style),
+// and MUST produce exactly the bytes Partition(v) returns - the equivalence and
+// the Partition/PartitionInto agreement tests enforce this.
+type PartitionAppender[T any] interface {
+	RowAppender[T]
+	PartitionInto(v *T, dst []byte) []byte
+}
+
 // reflectAppender is the default RowAppender: it interprets the reflected plan
 // per row. The per-field plan (offsets, typed closures) is built once by
-// buildPlan, but the boxing reflect.ValueOf/Interface forces remain per row —
+// buildPlan, but the boxing reflect.ValueOf/Interface forces remain per row -
 // which is exactly what roostgen removes.
 type reflectAppender[T any] struct{ pl *plan }
 

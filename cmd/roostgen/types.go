@@ -41,7 +41,7 @@ func resolve(t types.Type) (mapping, bool, error) {
 		t = ptr.Elem()
 	}
 
-	// time.Time (a named type) — check before the generic *types.Named reject.
+	// time.Time (a named type) - check before the generic *types.Named reject.
 	if named, ok := t.(*types.Named); ok {
 		o := named.Obj()
 		if o.Pkg() != nil && o.Pkg().Path() == "time" && o.Name() == "Time" {

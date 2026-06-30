@@ -113,7 +113,7 @@ func BenchmarkRollConcurrency(b *testing.B) {
 
 // samplePeakHeap polls live heap until stop is closed and returns the max
 // HeapAlloc seen. ReadMemStats briefly stops the world, so run this as a
-// dedicated memory pass — its ns/op is NOT meaningful, only the peak metrics.
+// dedicated memory pass - its ns/op is NOT meaningful, only the peak metrics.
 func samplePeakHeap(stop <-chan struct{}) uint64 {
 	var peak uint64
 	var ms runtime.MemStats

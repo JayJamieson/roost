@@ -16,7 +16,7 @@ import (
 // generate loads the package in dir and emits the roostgen file body for the
 // named struct types. The result is gofmt'd and deterministic (struct field
 // order), so it is safe to compare against a golden file. It never writes to
-// disk — that is the caller's job — which keeps it trivially testable.
+// disk - that is the caller's job - which keeps it trivially testable.
 func generate(dir string, typeNames []string) ([]byte, error) {
 	pkg, err := loadPackage(dir)
 	if err != nil {
@@ -126,6 +126,8 @@ func genForType(pkg *packages.Package, name string) (genType, bool, error) {
 		return genType{}, false, fmt.Errorf("struct %s has no data columns", name)
 	}
 	gt.PartitionBody = buildPartitionBody(parts)
+	gt.PartitionIntoBody = buildPartitionIntoBody(parts)
+	gt.Partitioned = len(parts) > 0
 	return gt, needStrconv, nil
 }
 
@@ -184,6 +186,31 @@ func buildPartitionBody(parts []partColumn) string {
 	return pre.String() + "return " + strings.Join(terms, " + ")
 }
 
+// buildPartitionIntoBody renders the body of the optional PartitionInto method,
+// appending each segment into the caller's reused buffer (zero allocations).
+// Returns "" when there are no partition columns, so the method is omitted.
+func buildPartitionIntoBody(parts []partColumn) string {
+	if len(parts) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for i, p := range parts {
+		prefix := p.name + "="
+		if i > 0 {
+			prefix = "/" + p.name + "="
+		}
+		b.WriteString(fmt.Sprintf("dst = append(dst, %q...)\n", prefix))
+		if p.nullable {
+			b.WriteString(fmt.Sprintf("if v.%s == nil {\ndst = append(dst, \"null\"...)\n} else {\ndst = roost.AppendSanitized(dst, %s)\n}\n",
+				p.goField, p.expr))
+		} else {
+			b.WriteString(fmt.Sprintf("dst = roost.AppendSanitized(dst, %s)\n", p.expr))
+		}
+	}
+	b.WriteString("return dst")
+	return b.String()
+}
+
 // lowerFirst lowercases the first rune, turning an exported type name into the
 // unexported package-level schema var name (Metric -> metricRoostSchema).
 func lowerFirst(s string) string {
@@ -199,12 +226,14 @@ func lowerFirst(s string) string {
 
 // genType is the per-type data the template renders.
 type genType struct {
-	GoName        string
-	SchemaVar     string
-	AppenderType  string
-	SchemaFields  []string
-	AppendStmts   []string
-	PartitionBody string
+	GoName            string
+	SchemaVar         string
+	AppenderType      string
+	SchemaFields      []string
+	AppendStmts       []string
+	PartitionBody     string
+	PartitionIntoBody string // "" when there are no partition columns
+	Partitioned       bool
 }
 
 // genFile is the whole emitted file's data.
@@ -246,13 +275,20 @@ var {{.SchemaVar}} = arrow.NewSchema([]arrow.Field{
 type {{.AppenderType}} struct{}
 
 var _ roost.RowAppender[{{.GoName}}] = {{.AppenderType}}{}
-
+{{if .Partitioned}}var _ roost.PartitionAppender[{{.GoName}}] = {{.AppenderType}}{}
+{{end}}
 func ({{.AppenderType}}) Schema() *arrow.Schema { return {{.SchemaVar}} }
 
 func ({{.AppenderType}}) Partition(v *{{.GoName}}) string {
 {{.PartitionBody}}
 }
-
+{{if .Partitioned}}
+// PartitionInto builds the same key as Partition into a reused buffer, letting
+// the Writer route rows without allocating a key string per row.
+func ({{.AppenderType}}) PartitionInto(v *{{.GoName}}, dst []byte) []byte {
+{{.PartitionIntoBody}}
+}
+{{end}}
 func ({{.AppenderType}}) Append(v *{{.GoName}}, b *array.RecordBuilder) {
 {{- range .AppendStmts}}
 	{{.}}

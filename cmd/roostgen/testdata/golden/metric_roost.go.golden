@@ -32,11 +32,22 @@ var metricRoostSchema = arrow.NewSchema([]arrow.Field{
 type MetricRoostAppender struct{}
 
 var _ roost.RowAppender[Metric] = MetricRoostAppender{}
+var _ roost.PartitionAppender[Metric] = MetricRoostAppender{}
 
 func (MetricRoostAppender) Schema() *arrow.Schema { return metricRoostSchema }
 
 func (MetricRoostAppender) Partition(v *Metric) string {
 	return "region=" + roost.SanitizeSegment(v.Region) + "/shard=" + roost.SanitizeSegment(strconv.FormatInt(int64(v.Shard), 10))
+}
+
+// PartitionInto builds the same key as Partition into a reused buffer, letting
+// the Writer route rows without allocating a key string per row.
+func (MetricRoostAppender) PartitionInto(v *Metric, dst []byte) []byte {
+	dst = append(dst, "region="...)
+	dst = roost.AppendSanitized(dst, v.Region)
+	dst = append(dst, "/shard="...)
+	dst = roost.AppendSanitized(dst, strconv.FormatInt(int64(v.Shard), 10))
+	return dst
 }
 
 func (MetricRoostAppender) Append(v *Metric, b *array.RecordBuilder) {

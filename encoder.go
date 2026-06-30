@@ -12,7 +12,7 @@ import (
 // every record for an object until the roll boundary.
 type Encoder interface {
 	// Open begins one Parquet object written to dst. The encoder must NOT
-	// close dst — the Writer owns the sink WriteCloser's lifecycle.
+	// close dst - the Writer owns the sink WriteCloser's lifecycle.
 	Open(ctx context.Context, dst io.Writer, schema *arrow.Schema) (ObjectEncoder, error)
 }
 

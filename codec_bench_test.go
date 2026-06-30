@@ -24,8 +24,8 @@ type Ev struct {
 // buildEv generates n deterministic rows for a profile and returns them plus the
 // logical (pre-encode) byte size, so a benchmark can report a compression ratio.
 //
-//	"logs"  — repetitive templates, low-cardinality labels, no payload: compressible
-//	"blobs" — random message + random 64B payload: high entropy, barely compressible
+//	"logs"  - repetitive templates, low-cardinality labels, no payload: compressible
+//	"blobs" - random message + random 64B payload: high entropy, barely compressible
 func buildEv(profile string, n int) ([]Ev, int64) {
 	rng := rand.New(rand.NewSource(1))
 	levels := []string{"INFO", "WARN", "ERROR", "DEBUG"}
@@ -67,10 +67,10 @@ func buildEv(profile string, n int) ([]Ev, int64) {
 // BenchmarkCodec compares Parquet codecs on compressible (logs) vs incompressible
 // (blobs) data. Each sub-benchmark re-encodes the same corpus and reports:
 //
-//	ratio  — logical input bytes / encoded bytes (higher = smaller files)
-//	outMB  — encoded object size
-//	peakMB — peak in-use heap (encoder window dominates; corpus is a constant baseline)
-//	MB/s   — input throughput (b.SetBytes), plus rec/s
+//	ratio  - logical input bytes / encoded bytes (higher = smaller files)
+//	outMB  - encoded object size
+//	peakMB - peak in-use heap (encoder window dominates; corpus is a constant baseline)
+//	MB/s   - input throughput (b.SetBytes), plus rec/s
 //
 // Run:  go test -bench Codec -benchmem -benchtime=10x
 func BenchmarkCodec(b *testing.B) {

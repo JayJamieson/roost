@@ -12,7 +12,7 @@ import (
 
 // metricRow is a representative hot-path row: a time.Time (which the reflection
 // path must box via reflect.Value.Interface), a string, a float, and a non-nil
-// nullable pointer — plus a partition column.
+// nullable pointer - plus a partition column.
 func metricRow() codegen.Metric {
 	v := 3.14
 	return codegen.Metric{TS: time.Now(), Host: "host-01", CPU: 0.42, Value: &v, Region: "us-east-1"}
@@ -59,6 +59,27 @@ func BenchmarkAppendGenerated(b *testing.B) {
 	}
 }
 
+// BenchmarkAppendGeneratedPtr measures the generated appender via AppendPtr with
+// a reused row buffer: the &v escape is hoisted out of the loop, and the
+// generated PartitionInto routes the row through a reused key buffer, so a
+// steady stream into an open partition appends with zero allocations.
+func BenchmarkAppendGeneratedPtr(b *testing.B) {
+	w, err := roost.NewWriterFor[codegen.Metric](context.Background(), nopSink{}, codegen.MetricRoostAppender{}, noRoll...)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer w.Close()
+	row := metricRow() // one buffer, reused across calls
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		row.CPU = float64(i)
+		if err := w.AppendPtr(&row); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // TestGeneratedReducesAllocs turns SPEC §7.4's acceptance criterion into a hard
 // gate: the generated appender must allocate <= 2 times per row and strictly
 // fewer than reflection. Unlike a benchmark, this fails CI on regression.
@@ -87,5 +108,22 @@ func TestGeneratedReducesAllocs(t *testing.T) {
 	}
 	if genAllocs >= refAllocs {
 		t.Errorf("generated allocs/op (%.2f) is not lower than reflection (%.2f)", genAllocs, refAllocs)
+	}
+}
+
+// TestGeneratedPtrZeroAllocPartition asserts the full optimization: AppendPtr
+// with a reused buffer into an already-open partition allocates nothing, because
+// PartitionInto routes the row through the Writer's reused key buffer.
+func TestGeneratedPtrZeroAllocPartition(t *testing.T) {
+	w, err := roost.NewWriterFor[codegen.Metric](context.Background(), nopSink{}, codegen.MetricRoostAppender{}, noRoll...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	row := metricRow()
+	allocs := testing.AllocsPerRun(2000, func() { _ = w.AppendPtr(&row) })
+	t.Logf("AppendPtr allocs/op (steady-state, partition open) = %.2f", allocs)
+	if math.Round(allocs) != 0 {
+		t.Errorf("AppendPtr allocs/op = %.2f, want 0", allocs)
 	}
 }

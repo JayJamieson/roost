@@ -84,7 +84,7 @@ with a checked-in generated file.
 | | Reflection - `NewWriter` | Codegen - `NewWriterFor` + `roostgen` |
 |---|---|---|
 | Setup | none; works on any struct immediately | `go generate`; regenerate on struct change |
-| Allocs/row | higher (struct + `time.Time` boxing) | ~0–2 (no boxing) |
+| Allocs/row | higher (struct + `time.Time` boxing) | 1 via `Append`, 0 via `AppendPtr` |
 | Hot-path ns/row | reflect overhead | direct field access |
 | Type safety | runtime errors from the plan | compile-time (`var _ RowAppender[T]`) |
 | Schema visibility | implicit | explicit in generated file |
@@ -92,11 +92,31 @@ with a checked-in generated file.
 | Supported types | bool, ints, uints, floats, string, `[]byte`, `time.Time`, pointers | the same set |
 | Best for | prototyping, moderate throughput, changing schemas | hot ingest on stable schemas |
 
+### Squeezing out the last allocations
+
+`Append(v T)` copies its argument to the heap (one alloc/row) because it takes
+the address of the value parameter. To remove it, reuse a row buffer and call
+`AppendPtr` - the escape then hoists out of your loop:
+
+```go
+row := Metric{Region: "us-east-1"}
+for ev := range stream {
+    row.TS, row.Host, row.CPU = ev.TS, ev.Host, ev.CPU // refill in place
+    w.AppendPtr(&row)
+}
+```
+
+For partitioned types, `roostgen` also emits `PartitionInto`, which the Writer
+uses to build the partition key into a reused buffer instead of allocating a
+fresh string per row. Combined with `AppendPtr`, a steady stream into open
+partitions appends with **zero allocations**.
+
 Append hot path, partitioned `Metric` with a `time.Time`, no roll (Apple M5):
 
 ```
-BenchmarkAppendReflection-10      300000      241.5 ns/op    1198 B/op    4 allocs/op
-BenchmarkAppendGenerated-10       300000      198.8 ns/op    1166 B/op    2 allocs/op
+BenchmarkAppendReflection-10     186 ns/op    4 allocs/op   // NewWriter, reflection
+BenchmarkAppendGenerated-10       99 ns/op    1 allocs/op   // NewWriterFor, Append(v T)
+BenchmarkAppendGeneratedPtr-10    80 ns/op    0 allocs/op   // NewWriterFor, AppendPtr(&row) reused
 ```
 
 ## Performance
