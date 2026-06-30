@@ -20,6 +20,16 @@
 // projected out of the file body, so a reader recovers them with
 // read_parquet('root/**/*.parquet', hive_partitioning=true).
 //
+// # Reflection vs. code generation
+//
+// There are two constructors. NewWriter[T] is the zero-setup default: it
+// reflects T once and interprets the plan per row. NewWriterFor[T] takes a
+// caller-supplied RowAppender[T] and does no reflection at all — typically a
+// type emitted by the roostgen command (see cmd/roostgen), which reads the
+// roost:"..." tags at generate time and bakes them into typed field access.
+// Both produce byte-equivalent Parquet; the generated path trades a build step
+// for fewer per-row allocations on hot ingest paths. See examples/codegen.
+//
 // # Dictionary encoding
 //
 // Dictionary encoding is OFF by default. Opt a column in with the `dict` tag or

@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 )
 
@@ -19,13 +20,15 @@ var (
 
 // Writer encodes a stream of T into Parquet objects via a Sink.
 type Writer[T any] struct {
-	ctx   context.Context
-	sink  Sink
-	enc   Encoder
-	mem   memory.Allocator
-	pl    *plan
-	cfg   config
-	runID int64
+	ctx    context.Context
+	sink   Sink
+	enc    Encoder
+	mem    memory.Allocator
+	app    RowAppender[T]
+	schema *arrow.Schema // == app.Schema(), cached
+	tPtr   bool          // T is a pointer type; needs a per-row nil guard
+	cfg    config
+	runID  int64
 
 	mu     sync.Mutex
 	parts  map[string]*partState
@@ -50,14 +53,17 @@ type Writer[T any] struct {
 // whole object's worth of records.
 type partState struct {
 	pathSeg  string
-	app      *appender
+	buf      *recordBuf
 	os       *objState     // nil until the first row group is flushed
 	ch       chan encodeOp // the worker this object is pinned to
 	objRows  int
 	objBytes int64
 }
 
-// NewWriter reflects T, validates it, and returns a ready Writer.
+// NewWriter reflects T, validates it, and returns a ready Writer. This is the
+// zero-setup default: it works on any supported struct immediately, at the cost
+// of per-row reflection. For hot ingest paths, generate a RowAppender with
+// roostgen and use NewWriterFor instead.
 func NewWriter[T any](ctx context.Context, sink Sink, opts ...Option) (*Writer[T], error) {
 	if sink == nil {
 		return nil, errors.New("roost: nil sink")
@@ -70,15 +76,51 @@ func NewWriter[T any](ctx context.Context, sink Sink, opts ...Option) (*Writer[T
 	for _, o := range opts {
 		o(&cfg)
 	}
+	return newWriter[T](ctx, sink, reflectAppender[T]{pl: pl}, pl.fileSchema, pl.dictCols, cfg), nil
+}
+
+// NewWriterFor is the zero-reflection path: a is typically a roostgen-emitted
+// appender (e.g. MetricRoostAppender{}). Everything else — options, sinks,
+// encoders, partitioning — is identical to NewWriter. Because T is only present
+// through the interface argument, callers usually need the explicit type
+// argument: roost.NewWriterFor[Metric](ctx, sink, MetricRoostAppender{}).
+//
+// Dictionary encoding via the `dict` struct tag is a reflection-path feature;
+// with NewWriterFor, request it explicitly with WithDictionaryColumns.
+func NewWriterFor[T any](ctx context.Context, sink Sink, a RowAppender[T], opts ...Option) (*Writer[T], error) {
+	if sink == nil {
+		return nil, errors.New("roost: nil sink")
+	}
+	if a == nil {
+		return nil, errors.New("roost: nil RowAppender")
+	}
+	sc := a.Schema()
+	if sc == nil || len(sc.Fields()) == 0 {
+		return nil, errors.New("roost: appender has empty schema")
+	}
+	cfg := defaultConfig()
+	for _, o := range opts {
+		o(&cfg)
+	}
+	return newWriter[T](ctx, sink, a, sc, nil, cfg), nil
+}
+
+// newWriter is the shared setup for both constructors: it wires the encoder,
+// the encode-worker pool, and the per-Writer state. tagDictCols are the
+// dictionary columns derived from struct tags (reflection path only); they are
+// unioned with WithDictionaryColumns.
+func newWriter[T any](ctx context.Context, sink Sink, app RowAppender[T], schema *arrow.Schema, tagDictCols []string, cfg config) *Writer[T] {
 	w := &Writer[T]{
-		ctx: ctx, sink: sink, mem: memory.DefaultAllocator, pl: pl, cfg: cfg,
+		ctx: ctx, sink: sink, mem: memory.DefaultAllocator,
+		app: app, schema: schema, cfg: cfg,
+		tPtr:  reflect.TypeOf((*T)(nil)).Elem().Kind() == reflect.Pointer,
 		runID: time.Now().UnixNano(), parts: make(map[string]*partState),
 	}
 	if cfg.encoder != nil {
 		w.enc = cfg.encoder
 	} else {
 		w.enc = NewPqarrowEncoder(cfg.codec, cfg.rowGroupRows,
-			PqarrowDictionaryColumns(unionDictCols(pl.dictCols, cfg.dictColumns)...),
+			PqarrowDictionaryColumns(unionDictCols(tagDictCols, cfg.dictColumns)...),
 			PqarrowCompressionLevel(cfg.codecLevel))
 	}
 	// A fixed pool of n encode workers runs compression + upload off w.mu. Even
@@ -95,18 +137,17 @@ func NewWriter[T any](ctx context.Context, sink Sink, opts ...Option) (*Writer[T
 		w.workers[i] = ch
 		go w.encodeWorker(ch)
 	}
-	return w, nil
+	return w
 }
 
-// Append writes one record. Cheap path: reflect, route, append to builders,
-// and flush a row group through the open encoder when one fills.
+// Append writes one record. Cheap path: route to a partition, append to
+// builders via the RowAppender, and flush a row group through the open encoder
+// when one fills. The generated RowAppender does this with zero reflection.
 func (w *Writer[T]) Append(v T) error {
-	rv := reflect.ValueOf(v)
-	for rv.Kind() == reflect.Pointer {
-		if rv.IsNil() {
-			return errNil
-		}
-		rv = rv.Elem()
+	// Only pointer-typed T needs the nil guard, and only then do we pay for a
+	// reflect call; value structs (and all generated appenders) skip it entirely.
+	if w.tPtr && nilPointer(v) {
+		return errNil
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -114,23 +155,24 @@ func (w *Writer[T]) Append(v T) error {
 		return errClosed
 	}
 
-	key := partitionPath(rv, w.pl.partCols)
+	key := w.app.Partition(&v)
 	ps := w.parts[key]
 	if ps == nil {
 		if err := w.evictIfNeeded(); err != nil {
 			return err
 		}
-		ps = &partState{pathSeg: key, app: newAppender(w.mem, w.pl.fileSchema, w.pl.dataCols)}
+		ps = &partState{pathSeg: key, buf: newRecordBuf(w.mem, w.schema)}
 		w.parts[key] = ps
 	}
 	w.touch(key)
 
-	ps.app.appendRow(rv)
+	w.app.Append(&v, ps.buf.b)
+	ps.buf.rows++
 	ps.objRows++
 	ps.objBytes += w.rowBytesEstimate()
 	w.stats.addRows(1)
 
-	if int64(ps.app.rows) >= w.cfg.rowGroupRows {
+	if int64(ps.buf.rows) >= w.cfg.rowGroupRows {
 		if err := w.flushRowGroup(ps); err != nil {
 			return err
 		}
@@ -173,7 +215,7 @@ func (w *Writer[T]) Close() error {
 		if err := w.finalizeLocked(ps); err != nil && firstErr == nil {
 			firstErr = err
 		}
-		ps.app.release()
+		ps.buf.release()
 	}
 	w.mu.Unlock()
 
@@ -202,7 +244,7 @@ func (w *Writer[T]) startObject(ps *partState) error {
 		return err
 	}
 	cw := &countWriter{w: wc}
-	obj, err := w.enc.Open(w.ctx, cw, w.pl.fileSchema)
+	obj, err := w.enc.Open(w.ctx, cw, w.schema)
 	if err != nil {
 		wc.Close()
 		return err
@@ -218,7 +260,7 @@ func (w *Writer[T]) startObject(ps *partState) error {
 // backpressure so Append runs at most ~one row group ahead of the compressor.
 // The send may briefly block on the buffer but never on compression itself.
 func (w *Writer[T]) flushRowGroup(ps *partState) error {
-	if ps.app.rows == 0 {
+	if ps.buf.rows == 0 {
 		return nil
 	}
 	if ps.os == nil {
@@ -226,7 +268,7 @@ func (w *Writer[T]) flushRowGroup(ps *partState) error {
 			return err
 		}
 	}
-	ps.ch <- encodeOp{os: ps.os, rec: ps.app.newRecord()} // worker compresses + releases
+	ps.ch <- encodeOp{os: ps.os, rec: ps.buf.newRecord()} // worker compresses + releases
 	return w.encErrLoad()
 }
 
@@ -286,8 +328,22 @@ func (w *Writer[T]) evictIfNeeded() error {
 		return nil
 	}
 	err := w.finalizeLocked(ps)
-	ps.app.release()
+	ps.buf.release()
 	return err
+}
+
+// nilPointer reports whether v is (or dereferences through) a nil pointer. It
+// is only called for pointer-typed T, preserving NewWriter's prior contract
+// that appending a nil pointer is an error; value structs never reach it.
+func nilPointer[T any](v T) bool {
+	rv := reflect.ValueOf(v)
+	for rv.Kind() == reflect.Pointer {
+		if rv.IsNil() {
+			return true
+		}
+		rv = rv.Elem()
+	}
+	return false
 }
 
 // unionDictCols merges the tag-derived and option-derived dictionary column

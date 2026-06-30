@@ -51,6 +51,54 @@ w.Close()
 
 Same `Writer[T]` surface either way; swap via `WithEncoder(roost.NewDuckDBEncoder(...))`.
 
+## Code generation (optional, zero-reflection)
+
+`NewWriter[T]` uses reflection: no setup, works on any struct immediately. For
+hot ingest paths where allocations matter, `roostgen` emits a typed appender
+that removes the per-row reflection, in the easyjson style - your `roost:"..."`
+tags are read at *generate* time instead of being interpreted on every row.
+
+```go
+//go:generate go run github.com/jayjamieson/roost/cmd/roostgen -type Metric
+```
+
+```sh
+go generate ./...   # writes metric_roost.go next to your type
+```
+
+Then swap the constructor - everything else (options, sinks, encoders,
+partitioning) is identical:
+
+```go
+// reflection (default)
+w, _ := roost.NewWriter[Metric](ctx, sink, opts...)
+// generated (zero-reflection)
+w, _ := roost.NewWriterFor[Metric](ctx, sink, MetricRoostAppender{}, opts...)
+```
+
+Both produce byte-equivalent Parquet (guaranteed by the equivalence test), so
+switching is just changing the constructor. Regenerate when the struct changes
+(same discipline as easyjson/sqlc). See `examples/codegen` for a worked setup
+with a checked-in generated file.
+
+| | Reflection - `NewWriter` | Codegen - `NewWriterFor` + `roostgen` |
+|---|---|---|
+| Setup | none; works on any struct immediately | `go generate`; regenerate on struct change |
+| Allocs/row | higher (struct + `time.Time` boxing) | ~0–2 (no boxing) |
+| Hot-path ns/row | reflect overhead | direct field access |
+| Type safety | runtime errors from the plan | compile-time (`var _ RowAppender[T]`) |
+| Schema visibility | implicit | explicit in generated file |
+| Moving parts | one code path | extra generated file + build-time generator dep |
+| Supported types | bool, ints, uints, floats, string, `[]byte`, `time.Time`, pointers | the same set |
+| Best for | prototyping, moderate throughput, changing schemas | hot ingest on stable schemas |
+
+Append hot path, partitioned `Metric` with a `time.Time`, no roll (Apple M5):
+
+```
+BenchmarkAppendReflection-10      300000      241.5 ns/op    1198 B/op    4 allocs/op
+BenchmarkAppendGenerated-10       300000      198.8 ns/op    1166 B/op    2 allocs/op
+```
+
 ## Performance
 
 ```
