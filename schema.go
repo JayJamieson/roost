@@ -9,6 +9,7 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/jayjamieson/roost/internal/roosttag"
 )
 
 var timeType = reflect.TypeOf(time.Time{})
@@ -75,26 +76,47 @@ func buildPlan(t reflect.Type) (*plan, error) {
 	return &plan{fileSchema: arrow.NewSchema(fields, nil), dataCols: data, partCols: parts, dictCols: dictCols}, nil
 }
 
+// parseTag is a thin adapter over the shared roosttag parser, which the
+// generator (cmd/roostgen) uses too so the two paths can't drift.
 func parseTag(sf reflect.StructField) (name string, partition, omit, dict bool) {
-	name = sf.Name
-	tag := sf.Tag.Get("roost")
-	if tag == "" {
-		return name, false, false, false
+	t := roosttag.Parse(sf.Tag.Get("roost"), sf.Name)
+	return t.Name, t.Partition, t.Omit, t.Dict
+}
+
+// SanitizeSegment keeps partition values safe for paths and object keys. It is
+// exported so roostgen-emitted code (which lives in the caller's package) builds
+// byte-identical Hive paths to the reflection path.
+func SanitizeSegment(s string) string {
+	if s == "" {
+		return "__empty__"
 	}
-	for _, p := range strings.Split(tag, ",") {
-		p = strings.TrimSpace(p)
-		switch {
-		case p == "-" || p == "omit":
-			omit = true
-		case p == "partition":
-			partition = true
-		case p == "dict":
-			dict = true
-		case strings.HasPrefix(p, "name="):
-			name = strings.TrimPrefix(p, "name=")
+	return strings.Map(func(r rune) rune {
+		switch r {
+		case '/', '\\', '=', ' ', '\t', '\n', '\r', '"', '\'':
+			return '_'
+		}
+		return r
+	}, s)
+}
+
+// AppendSanitized appends SanitizeSegment(s) to dst and returns the extended
+// slice, without allocating an intermediate string. Generated PartitionInto
+// methods use it to build partition keys into a reused buffer. All sanitized
+// characters are single-byte ASCII and every other byte is copied verbatim, so
+// the result is byte-identical to SanitizeSegment(s) (asserted by test).
+func AppendSanitized(dst []byte, s string) []byte {
+	if s == "" {
+		return append(dst, "__empty__"...)
+	}
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '/', '\\', '=', ' ', '\t', '\n', '\r', '"', '\'':
+			dst = append(dst, '_')
+		default:
+			dst = append(dst, s[i])
 		}
 	}
-	return name, partition, omit, dict
+	return dst
 }
 
 // elem dereferences a pointer field, reporting ok=false for a nil pointer.

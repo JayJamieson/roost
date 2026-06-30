@@ -66,7 +66,7 @@ func WithEncoder(e Encoder) Option { return func(o *config) { o.encoder = e } }
 // unioned with any columns carrying the `dict` struct tag.
 //
 // Dictionary encoding shrinks low-cardinality, repetitive columns (enums, status
-// codes, region names) and often speeds them up. Leave it off — the default —
+// codes, region names) and often speeds them up. Leave it off - the default -
 // for high-cardinality or unique columns (IDs, timestamps, random/binary blobs):
 // there it only burns memory and CPU building a dictionary that never pays off.
 //

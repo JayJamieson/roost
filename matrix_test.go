@@ -21,7 +21,7 @@ func envInt(k string, def int) int {
 	return def
 }
 
-// samplePeakInuse polls HeapInuse (in-use heap spans — steadier than HeapAlloc)
+// samplePeakInuse polls HeapInuse (in-use heap spans - steadier than HeapAlloc)
 // until stop is closed and returns the max seen.
 func samplePeakInuse(stop <-chan struct{}) uint64 {
 	var peak uint64
@@ -51,8 +51,8 @@ func samplePeakInuse(stop <-chan struct{}) uint64 {
 //	CSV,conc,level,recPerSec,inputMBps,diskMBps,peakHeapMB
 //
 // Config: ROOST_CONC, ROOST_LEVEL (0=codec default), ROOST_N, ROOST_CODEC (none, snappy, zstd). Roll == row group
-// (one row group per object) so objects turn over and encode concurrency — which
-// parallelizes across objects, not within one object — is actually exercised.
+// (one row group per object) so objects turn over and encode concurrency - which
+// parallelizes across objects, not within one object - is actually exercised.
 // Incompressible payload (buildCorpus) makes zstd do real work.
 func TestMemThroughputMatrix(t *testing.T) {
 	if os.Getenv("ROOST_MATRIX") == "" {

@@ -20,13 +20,29 @@
 // projected out of the file body, so a reader recovers them with
 // read_parquet('root/**/*.parquet', hive_partitioning=true).
 //
+// # Reflection vs. code generation
+//
+// There are two constructors. NewWriter[T] is the zero-setup default: it
+// reflects T once and interprets the plan per row. NewWriterFor[T] takes a
+// caller-supplied RowAppender[T] and does no reflection at all - typically a
+// type emitted by the roostgen command (see cmd/roostgen), which reads the
+// roost:"..." tags at generate time and bakes them into typed field access.
+// Both produce byte-equivalent Parquet; the generated path trades a build step
+// for fewer per-row allocations on hot ingest paths. See examples/codegen.
+//
+// Append(v T) copies its argument to the heap (one allocation per row). Hot
+// paths can reuse a row buffer and call AppendPtr(*T) to avoid that copy; for
+// partitioned generated types roostgen also emits a PartitionInto method that
+// lets the Writer build partition keys into a reused buffer, so AppendPtr into
+// already-open partitions appends with zero allocations.
+//
 // # Dictionary encoding
 //
 // Dictionary encoding is OFF by default. Opt a column in with the `dict` tag or
 // WithDictionaryColumns when its values are low-cardinality and repetitive
 // (enums, status codes, region names): the dictionary shrinks the column and
 // usually speeds it up. Leave it off for high-cardinality or unique columns
-// (IDs, timestamps, random or binary blobs) — there a dictionary only burns
+// (IDs, timestamps, random or binary blobs) - there a dictionary only burns
 // memory and CPU on a memo table that never compresses.
 //
 // # Memory

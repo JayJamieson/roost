@@ -9,37 +9,27 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 )
 
-// appender turns struct values into Arrow rows using a precomputed plan.
-// Reflection happens per row but the per-field plan (offsets, typed append
-// closures) is built once, so there is no per-call type parsing.
-type appender struct {
+// recordBuf is one partition's Arrow record builder plus a row counter. How a
+// row becomes columns now lives behind RowAppender (reflection or generated);
+// this is just the buffer the Writer fills and snapshots into row groups.
+type recordBuf struct {
 	b    *array.RecordBuilder
-	cols []fieldPlan
 	rows int
 }
 
-func newAppender(mem memory.Allocator, schema *arrow.Schema, cols []fieldPlan) *appender {
-	return &appender{b: array.NewRecordBuilder(mem, schema), cols: cols}
-}
-
-// appendRow appends one struct (already dereferenced to a struct Value).
-func (a *appender) appendRow(rv reflect.Value) {
-	for i := range a.cols {
-		a.cols[i].appendTo(a.b.Field(i), rv.Field(a.cols[i].structIndex))
-	}
-	a.rows++
+func newRecordBuf(mem memory.Allocator, schema *arrow.Schema) *recordBuf {
+	return &recordBuf{b: array.NewRecordBuilder(mem, schema)}
 }
 
 // newRecord snapshots the buffered rows into an immutable record and resets.
-func (a *appender) newRecord() arrow.RecordBatch {
-	a.rows = 0
-	return a.b.NewRecord()
-}
+func (r *recordBuf) newRecord() arrow.RecordBatch { r.rows = 0; return r.b.NewRecord() }
 
-func (a *appender) release() { a.b.Release() }
+func (r *recordBuf) release() { r.b.Release() }
 
 // partitionPath builds the Hive path segment ("k1=v1/k2=v2") for a row, also
 // used as the partition map key. Empty when there are no partition columns.
+// This backs the reflection RowAppender; the generated one inlines the same
+// logic with direct field access.
 func partitionPath(rv reflect.Value, parts []fieldPlan) string {
 	if len(parts) == 0 {
 		return ""
@@ -51,21 +41,7 @@ func partitionPath(rv reflect.Value, parts []fieldPlan) string {
 		}
 		sb.WriteString(parts[i].name)
 		sb.WriteByte('=')
-		sb.WriteString(sanitizeSegment(parts[i].format(rv.Field(parts[i].structIndex))))
+		sb.WriteString(SanitizeSegment(parts[i].format(rv.Field(parts[i].structIndex))))
 	}
 	return sb.String()
-}
-
-// sanitizeSegment keeps partition values safe for paths and object keys.
-func sanitizeSegment(s string) string {
-	if s == "" {
-		return "__empty__"
-	}
-	return strings.Map(func(r rune) rune {
-		switch r {
-		case '/', '\\', '=', ' ', '\t', '\n', '\r', '"', '\'':
-			return '_'
-		}
-		return r
-	}, s)
 }

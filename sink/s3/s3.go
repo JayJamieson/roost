@@ -1,5 +1,5 @@
 // Package s3 is a roost.Sink for S3 / Cloudflare R2. Each object is written
-// to a spill temp file and uploaded with a single PutObject on Close — no
+// to a spill temp file and uploaded with a single PutObject on Close - no
 // multipart (consumers who need multipart implement their own sink). The
 // upload streams from the seekable spill file with a known Content-Length and
 // can be bandwidth-limited by a shared token bucket.

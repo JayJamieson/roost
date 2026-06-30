@@ -51,6 +51,74 @@ w.Close()
 
 Same `Writer[T]` surface either way; swap via `WithEncoder(roost.NewDuckDBEncoder(...))`.
 
+## Code generation (optional, zero-reflection)
+
+`NewWriter[T]` uses reflection: no setup, works on any struct immediately. For
+hot ingest paths where allocations matter, `roostgen` emits a typed appender
+that removes the per-row reflection, in the easyjson style - your `roost:"..."`
+tags are read at *generate* time instead of being interpreted on every row.
+
+```go
+//go:generate go run github.com/jayjamieson/roost/cmd/roostgen -type Metric
+```
+
+```sh
+go generate ./...   # writes metric_roost.go next to your type
+```
+
+Then swap the constructor - everything else (options, sinks, encoders,
+partitioning) is identical:
+
+```go
+// reflection (default)
+w, _ := roost.NewWriter[Metric](ctx, sink, opts...)
+// generated (zero-reflection)
+w, _ := roost.NewWriterFor[Metric](ctx, sink, MetricRoostAppender{}, opts...)
+```
+
+Both produce byte-equivalent Parquet (guaranteed by the equivalence test), so
+switching is just changing the constructor. Regenerate when the struct changes
+(same discipline as easyjson/sqlc). See `examples/codegen` for a worked setup
+with a checked-in generated file.
+
+| | Reflection - `NewWriter` | Codegen - `NewWriterFor` + `roostgen` |
+|---|---|---|
+| Setup | none; works on any struct immediately | `go generate`; regenerate on struct change |
+| Allocs/row | higher (struct + `time.Time` boxing) | 1 via `Append`, 0 via `AppendPtr` |
+| Hot-path ns/row | reflect overhead | direct field access |
+| Type safety | runtime errors from the plan | compile-time (`var _ RowAppender[T]`) |
+| Schema visibility | implicit | explicit in generated file |
+| Moving parts | one code path | extra generated file + build-time generator dep |
+| Supported types | bool, ints, uints, floats, string, `[]byte`, `time.Time`, pointers | the same set |
+| Best for | prototyping, moderate throughput, changing schemas | hot ingest on stable schemas |
+
+### Squeezing out the last allocations
+
+`Append(v T)` copies its argument to the heap (one alloc/row) because it takes
+the address of the value parameter. To remove it, reuse a row buffer and call
+`AppendPtr` - the escape then hoists out of your loop:
+
+```go
+row := Metric{Region: "us-east-1"}
+for ev := range stream {
+    row.TS, row.Host, row.CPU = ev.TS, ev.Host, ev.CPU // refill in place
+    w.AppendPtr(&row)
+}
+```
+
+For partitioned types, `roostgen` also emits `PartitionInto`, which the Writer
+uses to build the partition key into a reused buffer instead of allocating a
+fresh string per row. Combined with `AppendPtr`, a steady stream into open
+partitions appends with **zero allocations**.
+
+Append hot path, partitioned `Metric` with a `time.Time`, no roll (Apple M5):
+
+```
+BenchmarkAppendReflection-10     186 ns/op    4 allocs/op   // NewWriter, reflection
+BenchmarkAppendGenerated-10       99 ns/op    1 allocs/op   // NewWriterFor, Append(v T)
+BenchmarkAppendGeneratedPtr-10    80 ns/op    0 allocs/op   // NewWriterFor, AppendPtr(&row) reused
+```
+
 ## Performance
 
 ```

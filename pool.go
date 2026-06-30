@@ -8,7 +8,7 @@ import (
 
 // objState is the per-object encode state shared by all of an object's ops. All
 // ops for one object are routed to a single worker (affinity), so failed is only
-// ever touched by that one goroutine — no synchronization needed.
+// ever touched by that one goroutine - no synchronization needed.
 type objState struct {
 	obj    ObjectEncoder
 	wc     io.WriteCloser
