@@ -11,11 +11,29 @@
 //	    RSN     int64     `roost:"name=rsn"`
 //	    Time    time.Time `roost:"name=event_time"`
 //	    Region  string    `roost:"name=region,partition"` // -> region=us-east-1/...
-//	    Payload []byte
+//	    Status  string    `roost:"name=status,dict"`      // low-cardinality -> dictionary
+//	    Payload []byte                                     // high-cardinality -> plain
 //	    Skip    string    `roost:"-"`                     // omitted
 //	}
 //
 // Partition columns live in the object path (Hive convention) and are
 // projected out of the file body, so a reader recovers them with
 // read_parquet('root/**/*.parquet', hive_partitioning=true).
+//
+// # Dictionary encoding
+//
+// Dictionary encoding is OFF by default. Opt a column in with the `dict` tag or
+// WithDictionaryColumns when its values are low-cardinality and repetitive
+// (enums, status codes, region names): the dictionary shrinks the column and
+// usually speeds it up. Leave it off for high-cardinality or unique columns
+// (IDs, timestamps, random or binary blobs) — there a dictionary only burns
+// memory and CPU on a memo table that never compresses.
+//
+// # Memory
+//
+// The Writer streams: each filled row group is encoded and released immediately,
+// so resident memory is one row group per open partition, independent of the
+// (much larger) roll size. Under high WithEncodeConcurrency the dominant cost is
+// the compressor's per-encoder window; WithCompressionLevel trades ratio for a
+// smaller window, and the concurrency bound caps how many encoders run at once.
 package roost

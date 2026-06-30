@@ -59,9 +59,10 @@ func benchLocalThroughput(b *testing.B, fsync bool) {
 	}
 	// Smaller rolls => more objects => more fsyncs, widening the fsync gap.
 	w, err := roost.NewWriter[LocalRow](context.Background(), sink,
-		roost.WithCodec("zstd"),
+		roost.WithCompressionLevel(1),
+		roost.WithCodec("snappy"),
 		roost.WithRowGroupRows(25_000),
-		roost.WithRollRows(25_000),
+		roost.WithRollRows(100_000),
 	)
 	if err != nil {
 		b.Fatal(err)

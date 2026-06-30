@@ -9,7 +9,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 )
 
@@ -31,18 +30,31 @@ type Writer[T any] struct {
 	mu     sync.Mutex
 	parts  map[string]*partState
 	order  []string // LRU of partition keys
-	pool   *encodePool
 	stats  statCounter
 	closed bool
+
+	// Fixed pool of encode workers: compression + upload run off w.mu, on a
+	// bounded set of goroutines. Each object is pinned to one worker (round-robin
+	// at open) so its row groups stay ordered. nextWorker/objSeq are guarded by mu.
+	workers    []chan encodeOp
+	nextWorker int
+	objSeq     int // monotonic across all objects so names never collide on eviction
+	wg         sync.WaitGroup
+	encMu      sync.Mutex
+	encErr     error
 }
 
+// partState holds one partition's open object. Instead of buffering every
+// record until the roll boundary, it streams each filled row group to its
+// assigned encode worker, so resident memory is one row group rather than a
+// whole object's worth of records.
 type partState struct {
 	pathSeg  string
 	app      *appender
-	recs     []arrow.RecordBatch
+	os       *objState     // nil until the first row group is flushed
+	ch       chan encodeOp // the worker this object is pinned to
 	objRows  int
 	objBytes int64
-	seq      int
 }
 
 // NewWriter reflects T, validates it, and returns a ready Writer.
@@ -65,15 +77,29 @@ func NewWriter[T any](ctx context.Context, sink Sink, opts ...Option) (*Writer[T
 	if cfg.encoder != nil {
 		w.enc = cfg.encoder
 	} else {
-		w.enc = NewPqarrowEncoder(cfg.codec, cfg.rowGroupRows)
+		w.enc = NewPqarrowEncoder(cfg.codec, cfg.rowGroupRows,
+			PqarrowDictionaryColumns(unionDictCols(pl.dictCols, cfg.dictColumns)...),
+			PqarrowCompressionLevel(cfg.codecLevel))
 	}
-	if cfg.concurrency > 1 {
-		w.pool = newEncodePool(cfg.concurrency, w.runJob)
+	// A fixed pool of n encode workers runs compression + upload off w.mu. Even
+	// at concurrency 1 the single worker pipelines encoding with Append. The
+	// goroutine count is exactly n regardless of partition/object churn.
+	n := cfg.concurrency
+	if n < 1 {
+		n = 1
+	}
+	w.workers = make([]chan encodeOp, n)
+	w.wg.Add(n)
+	for i := range w.workers {
+		ch := make(chan encodeOp, 2) // small buffer lets Append run ~1 row group ahead of the compressor
+		w.workers[i] = ch
+		go w.encodeWorker(ch)
 	}
 	return w, nil
 }
 
-// Append writes one record. Cheap path only: reflect, route, buffer.
+// Append writes one record. Cheap path: reflect, route, append to builders,
+// and flush a row group through the open encoder when one fills.
 func (w *Writer[T]) Append(v T) error {
 	rv := reflect.ValueOf(v)
 	for rv.Kind() == reflect.Pointer {
@@ -105,9 +131,13 @@ func (w *Writer[T]) Append(v T) error {
 	w.stats.addRows(1)
 
 	if int64(ps.app.rows) >= w.cfg.rowGroupRows {
-		ps.recs = append(ps.recs, ps.app.newRecord())
+		if err := w.flushRowGroup(ps); err != nil {
+			return err
+		}
 	}
 	if ps.objRows >= w.cfg.rollRows || (w.cfg.rollBytes > 0 && ps.objBytes >= w.cfg.rollBytes) {
+		// fmt.Printf("ps.objRows: %d >= w.cfg.rollRows: %d || w.cfg.rollBytes: %d > ps.objBytes: %d > w.cfg.rollBytes: %d \n", ps.objRows, w.cfg.rollRows, w.cfg.rollBytes, ps.objBytes, w.cfg.rollBytes)
+		// fmt.Printf("%v, %v\n", ps.objRows >= w.cfg.rollRows, w.cfg.rollBytes > 0 && ps.objBytes >= w.cfg.rollBytes)
 		return w.finalizeLocked(ps)
 	}
 	return nil
@@ -129,7 +159,8 @@ func (w *Writer[T]) Flush() error {
 	return firstErr
 }
 
-// Close finalizes all objects, drains the encode pool, and releases builders.
+// Close finalizes all objects, waits for the encode goroutines to drain, and
+// releases builders.
 func (w *Writer[T]) Close() error {
 	w.mu.Lock()
 	if w.closed {
@@ -146,10 +177,12 @@ func (w *Writer[T]) Close() error {
 	}
 	w.mu.Unlock()
 
-	if w.pool != nil {
-		if err := w.pool.close(); err != nil && firstErr == nil {
-			firstErr = err
-		}
+	for _, ch := range w.workers {
+		close(ch) // no more ops will be sent (closed == true)
+	}
+	w.wg.Wait() // workers drain queued ops (footer + upload) and exit
+	if ee := w.encErrLoad(); ee != nil && firstErr == nil {
+		firstErr = ee
 	}
 	return firstErr
 }
@@ -157,53 +190,72 @@ func (w *Writer[T]) Close() error {
 // Stats returns a snapshot of progress.
 func (w *Writer[T]) Stats() Stats { return w.stats.snapshot() }
 
-// finalizeLocked emits the current object for ps. Caller holds w.mu.
-func (w *Writer[T]) finalizeLocked(ps *partState) error {
-	if ps.app.rows > 0 {
-		ps.recs = append(ps.recs, ps.app.newRecord())
-	}
-	if len(ps.recs) == 0 {
-		return nil
-	}
-	job := encodeJob{name: w.objectName(ps), recs: ps.recs}
-	ps.recs = nil
-	ps.objRows = 0
-	ps.objBytes = 0
-	ps.seq++
-	if w.pool != nil {
-		w.pool.submit(job) // async; errors surface at Close
-		return nil
-	}
-	return w.runJob(job)
-}
-
-// runJob encodes one object and writes it through the sink. Safe for pool
-// workers: it touches only the sink, the encoder, and the (locked) stats.
-func (w *Writer[T]) runJob(j encodeJob) error {
-	defer releaseRecs(j.recs)
-	wc, err := w.sink.Create(w.ctx, j.name)
+// startObject opens the sink object + encoder for ps and pins it to one encode
+// worker (round-robin). Caller holds w.mu; called lazily on the first row group
+// flush so a partition that never fills a row group costs nothing until it
+// finalizes.
+func (w *Writer[T]) startObject(ps *partState) error {
+	name := w.objectName(ps.pathSeg, w.objSeq)
+	w.objSeq++
+	wc, err := w.sink.Create(w.ctx, name)
 	if err != nil {
 		return err
 	}
 	cw := &countWriter{w: wc}
-	encErr := w.enc.EncodeObject(w.ctx, cw, w.pl.fileSchema, j.recs)
-	closeErr := wc.Close()
-	if encErr != nil {
-		return encErr
+	obj, err := w.enc.Open(w.ctx, cw, w.pl.fileSchema)
+	if err != nil {
+		wc.Close()
+		return err
 	}
-	if closeErr != nil {
-		return closeErr
-	}
-	w.stats.addObject(cw.n)
+	ps.os = &objState{obj: obj, wc: wc, cw: cw}
+	ps.ch = w.workers[w.nextWorker%len(w.workers)]
+	w.nextWorker++
 	return nil
 }
 
-func (w *Writer[T]) objectName(ps *partState) string {
-	file := fmt.Sprintf("part-%016x-%05d.parquet", w.runID, ps.seq)
-	if ps.pathSeg == "" {
+// flushRowGroup snapshots the buffered rows as one record and hands it to the
+// object's assigned worker (in order). The worker's bounded channel applies
+// backpressure so Append runs at most ~one row group ahead of the compressor.
+// The send may briefly block on the buffer but never on compression itself.
+func (w *Writer[T]) flushRowGroup(ps *partState) error {
+	if ps.app.rows == 0 {
+		return nil
+	}
+	if ps.os == nil {
+		if err := w.startObject(ps); err != nil {
+			return err
+		}
+	}
+	ps.ch <- encodeOp{os: ps.os, rec: ps.app.newRecord()} // worker compresses + releases
+	return w.encErrLoad()
+}
+
+// finalizeLocked queues the footer + upload for ps's object on its worker and
+// resets ps for the next object. Caller holds w.mu. Finalization is
+// asynchronous; errors surface at a later call or at Close.
+func (w *Writer[T]) finalizeLocked(ps *partState) error {
+	if err := w.flushRowGroup(ps); err != nil { // any leftover rows < a row group
+		return err
+	}
+	if ps.os == nil {
+		return nil // nothing was ever written for this object
+	}
+	ps.ch <- encodeOp{os: ps.os} // rec == nil: worker writes footer + upload
+	ps.os = nil
+	ps.ch = nil
+	ps.objRows = 0
+	ps.objBytes = 0
+	return w.encErrLoad()
+}
+
+// objectName builds a unique object path. seq is monotonic across the whole
+// Writer, so names never collide even when a partition is evicted and reopened.
+func (w *Writer[T]) objectName(pathSeg string, seq int) string {
+	file := fmt.Sprintf("part-%016x-%05d.parquet", w.runID, seq)
+	if pathSeg == "" {
 		return file
 	}
-	return path.Join(ps.pathSeg, file)
+	return path.Join(pathSeg, file)
 }
 
 // rowBytesEstimate is a cheap fixed estimate for byte-based rolling. It is
@@ -238,10 +290,21 @@ func (w *Writer[T]) evictIfNeeded() error {
 	return err
 }
 
-func releaseRecs(recs []arrow.RecordBatch) {
-	for _, r := range recs {
-		r.Release()
+// unionDictCols merges the tag-derived and option-derived dictionary column
+// lists, de-duplicating while keeping a stable order (tag columns first).
+func unionDictCols(tag, opt []string) []string {
+	if len(tag) == 0 && len(opt) == 0 {
+		return nil
 	}
+	seen := make(map[string]struct{}, len(tag)+len(opt))
+	out := make([]string, 0, len(tag)+len(opt))
+	for _, c := range append(append([]string(nil), tag...), opt...) {
+		if _, ok := seen[c]; !ok {
+			seen[c] = struct{}{}
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // countWriter counts bytes written for Stats.
