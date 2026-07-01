@@ -62,7 +62,7 @@ func main() {
 	}
 
 	for i := 0; i < 1_000_000; i++ {
-		if err := w.Append(Event{
+		if err := w.Append(&Event{
 			RSN: int64(i), Time: time.Now(), Region: "us-east-1", Payload: []byte("…"),
 		}); err != nil {
 			log.Fatal(err)

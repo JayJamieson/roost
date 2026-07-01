@@ -18,26 +18,15 @@ type RowAppender[T any] interface {
 	// Schema is the Parquet file schema, partition columns excluded (Hive
 	// convention). It is built once and must be stable for the appender's life.
 	Schema() *arrow.Schema
-	// Partition returns the sanitized Hive path segment for v
-	// ("region=us-east-1/dt=2026-06-29"), or "" when there are no partition
-	// columns.
-	Partition(v *T) string
+	// PartitionInto appends v's sanitized Hive key ("region=us-east-1/dt=...")
+	// to dst and returns the extended slice (append-style), appending nothing
+	// when there are no partition columns. The Writer builds keys into a reused
+	// buffer through this, so a steady stream into already-open partitions
+	// appends with zero allocations. roostgen's generated keys must stay
+	// byte-identical to the reflection path (the equivalence test enforces it).
+	PartitionInto(v *T, dst []byte) []byte
 	// Append appends one row's data columns into b, in Schema() field order.
 	Append(v *T, b *array.RecordBuilder)
-}
-
-// PartitionAppender is an optional optimization a RowAppender may also implement
-// (roostgen emits it for partitioned types). When the Writer sees it, it builds
-// the partition key into a reused scratch buffer via PartitionInto instead of
-// allocating a fresh string from Partition every row, so a steady stream into
-// already-open partitions appends with zero allocations.
-//
-// PartitionInto MUST append to dst and return the extended slice (append-style),
-// and MUST produce exactly the bytes Partition(v) returns - the equivalence and
-// the Partition/PartitionInto agreement tests enforce this.
-type PartitionAppender[T any] interface {
-	RowAppender[T]
-	PartitionInto(v *T, dst []byte) []byte
 }
 
 // reflectAppender is the default RowAppender: it interprets the reflected plan
@@ -48,11 +37,21 @@ type reflectAppender[T any] struct{ pl *plan }
 
 func (a reflectAppender[T]) Schema() *arrow.Schema { return a.pl.fileSchema }
 
-func (a reflectAppender[T]) Partition(v *T) string {
-	if len(a.pl.partCols) == 0 {
-		return ""
+func (a reflectAppender[T]) PartitionInto(v *T, dst []byte) []byte {
+	parts := a.pl.partCols
+	if len(parts) == 0 {
+		return dst
 	}
-	return partitionPath(structOf(v), a.pl.partCols)
+	rv := structOf(v)
+	for i := range parts {
+		if i > 0 {
+			dst = append(dst, '/')
+		}
+		dst = append(dst, parts[i].name...)
+		dst = append(dst, '=')
+		dst = AppendSanitized(dst, parts[i].format(rv.Field(parts[i].structIndex)))
+	}
+	return dst
 }
 
 func (a reflectAppender[T]) Append(v *T, b *array.RecordBuilder) {
@@ -62,13 +61,8 @@ func (a reflectAppender[T]) Append(v *T, b *array.RecordBuilder) {
 	}
 }
 
-// structOf dereferences *T to the underlying struct value, unwrapping any extra
-// pointer indirection when T is itself a pointer type. Callers guarantee the
-// chain is non-nil (Writer.Append rejects nil pointers up front).
+// structOf dereferences *T to the underlying struct value. Callers guarantee v
+// is non-nil (Writer.Append rejects nil pointers up front).
 func structOf[T any](v *T) reflect.Value {
-	rv := reflect.ValueOf(v).Elem()
-	for rv.Kind() == reflect.Pointer {
-		rv = rv.Elem()
-	}
-	return rv
+	return reflect.ValueOf(v).Elem()
 }

@@ -35,35 +35,17 @@ func BenchmarkAppendReflection(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		row.CPU = float64(i)
-		if err := w.Append(row); err != nil {
+		if err := w.Append(&row); err != nil {
 			b.Fatal(err)
 		}
 	}
 }
 
-// BenchmarkAppendGenerated measures the roostgen appender (zero reflection).
+// BenchmarkAppendGenerated measures the roostgen appender (zero reflection) with
+// a reused row buffer: the pointer's escape is hoisted out of the loop, and the
+// generated PartitionInto routes the row through a reused key buffer, so a steady
+// stream into an open partition appends with zero allocations.
 func BenchmarkAppendGenerated(b *testing.B) {
-	w, err := roost.NewWriterFor[codegen.Metric](context.Background(), nopSink{}, codegen.MetricRoostAppender{}, noRoll...)
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer w.Close()
-	row := metricRow()
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		row.CPU = float64(i)
-		if err := w.Append(row); err != nil {
-			b.Fatal(err)
-		}
-	}
-}
-
-// BenchmarkAppendGeneratedPtr measures the generated appender via AppendPtr with
-// a reused row buffer: the &v escape is hoisted out of the loop, and the
-// generated PartitionInto routes the row through a reused key buffer, so a
-// steady stream into an open partition appends with zero allocations.
-func BenchmarkAppendGeneratedPtr(b *testing.B) {
 	w, err := roost.NewWriterFor[codegen.Metric](context.Background(), nopSink{}, codegen.MetricRoostAppender{}, noRoll...)
 	if err != nil {
 		b.Fatal(err)
@@ -74,7 +56,7 @@ func BenchmarkAppendGeneratedPtr(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		row.CPU = float64(i)
-		if err := w.AppendPtr(&row); err != nil {
+		if err := w.Append(&row); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -91,14 +73,14 @@ func TestGeneratedReducesAllocs(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer wr.Close()
-	refAllocs := testing.AllocsPerRun(2000, func() { _ = wr.Append(row) })
+	refAllocs := testing.AllocsPerRun(2000, func() { _ = wr.Append(&row) })
 
 	wg, err := roost.NewWriterFor[codegen.Metric](context.Background(), nopSink{}, codegen.MetricRoostAppender{}, noRoll...)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer wg.Close()
-	genAllocs := testing.AllocsPerRun(2000, func() { _ = wg.Append(row) })
+	genAllocs := testing.AllocsPerRun(2000, func() { _ = wg.Append(&row) })
 
 	t.Logf("allocs/op: reflection=%.2f generated=%.2f", refAllocs, genAllocs)
 	// Allocs/op is an integer count per row; round to ignore the sub-alloc noise
@@ -111,19 +93,19 @@ func TestGeneratedReducesAllocs(t *testing.T) {
 	}
 }
 
-// TestGeneratedPtrZeroAllocPartition asserts the full optimization: AppendPtr
-// with a reused buffer into an already-open partition allocates nothing, because
+// TestGeneratedZeroAllocPartition asserts the full optimization: appending a
+// reused buffer into an already-open partition allocates nothing, because
 // PartitionInto routes the row through the Writer's reused key buffer.
-func TestGeneratedPtrZeroAllocPartition(t *testing.T) {
+func TestGeneratedZeroAllocPartition(t *testing.T) {
 	w, err := roost.NewWriterFor[codegen.Metric](context.Background(), nopSink{}, codegen.MetricRoostAppender{}, noRoll...)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer w.Close()
 	row := metricRow()
-	allocs := testing.AllocsPerRun(2000, func() { _ = w.AppendPtr(&row) })
-	t.Logf("AppendPtr allocs/op (steady-state, partition open) = %.2f", allocs)
+	allocs := testing.AllocsPerRun(2000, func() { _ = w.Append(&row) })
+	t.Logf("Append allocs/op (steady-state, partition open) = %.2f", allocs)
 	if math.Round(allocs) != 0 {
-		t.Errorf("AppendPtr allocs/op = %.2f, want 0", allocs)
+		t.Errorf("Append allocs/op = %.2f, want 0", allocs)
 	}
 }

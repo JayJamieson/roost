@@ -127,7 +127,6 @@ func genForType(pkg *packages.Package, name string) (genType, bool, error) {
 	}
 	gt.PartitionBody = buildPartitionBody(parts)
 	gt.PartitionIntoBody = buildPartitionIntoBody(parts)
-	gt.Partitioned = len(parts) > 0
 	return gt, needStrconv, nil
 }
 
@@ -186,12 +185,12 @@ func buildPartitionBody(parts []partColumn) string {
 	return pre.String() + "return " + strings.Join(terms, " + ")
 }
 
-// buildPartitionIntoBody renders the body of the optional PartitionInto method,
+// buildPartitionIntoBody renders the body of the PartitionInto method,
 // appending each segment into the caller's reused buffer (zero allocations).
-// Returns "" when there are no partition columns, so the method is omitted.
+// With no partition columns it returns dst unchanged (empty key).
 func buildPartitionIntoBody(parts []partColumn) string {
 	if len(parts) == 0 {
-		return ""
+		return "return dst"
 	}
 	var b strings.Builder
 	for i, p := range parts {
@@ -232,8 +231,7 @@ type genType struct {
 	SchemaFields      []string
 	AppendStmts       []string
 	PartitionBody     string
-	PartitionIntoBody string // "" when there are no partition columns
-	Partitioned       bool
+	PartitionIntoBody string // "return dst" when there are no partition columns
 }
 
 // genFile is the whole emitted file's data.
@@ -275,20 +273,19 @@ var {{.SchemaVar}} = arrow.NewSchema([]arrow.Field{
 type {{.AppenderType}} struct{}
 
 var _ roost.RowAppender[{{.GoName}}] = {{.AppenderType}}{}
-{{if .Partitioned}}var _ roost.PartitionAppender[{{.GoName}}] = {{.AppenderType}}{}
-{{end}}
+
 func ({{.AppenderType}}) Schema() *arrow.Schema { return {{.SchemaVar}} }
 
 func ({{.AppenderType}}) Partition(v *{{.GoName}}) string {
 {{.PartitionBody}}
 }
-{{if .Partitioned}}
+
 // PartitionInto builds the same key as Partition into a reused buffer, letting
 // the Writer route rows without allocating a key string per row.
 func ({{.AppenderType}}) PartitionInto(v *{{.GoName}}, dst []byte) []byte {
 {{.PartitionIntoBody}}
 }
-{{end}}
+
 func ({{.AppenderType}}) Append(v *{{.GoName}}, b *array.RecordBuilder) {
 {{- range .AppendStmts}}
 	{{.}}

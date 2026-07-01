@@ -38,7 +38,7 @@ func TestConcurrentManyPartitionsStress(t *testing.T) {
 	const n = 24_000
 	for i := 0; i < n; i++ {
 		row := Event{RSN: int64(i), Time: time.Now(), Region: regions[i%len(regions)], Body: []byte("payload")}
-		if err := w.Append(row); err != nil {
+		if err := w.Append(&row); err != nil {
 			t.Fatalf("append %d: %v", i, err)
 		}
 	}

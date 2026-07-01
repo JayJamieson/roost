@@ -3,10 +3,6 @@ package roost_test
 import (
 	"context"
 	"fmt"
-	"io/fs"
-	"path/filepath"
-	"runtime"
-	"strings"
 	"testing"
 	"time"
 
@@ -33,27 +29,14 @@ func BenchmarkStreamingMem(b *testing.B) {
 			if err != nil {
 				b.Fatal(err)
 			}
-			runtime.GC()
-			var baseline runtime.MemStats
-			runtime.ReadMemStats(&baseline)
-
-			stop := make(chan struct{})
-			result := make(chan uint64, 1)
-			go func() { result <- samplePeakHeap(stop) }()
-
 			row := base
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				row.RSN = int64(i)
-				_ = w.Append(row)
-			}
-			_ = w.Close()
-			b.StopTimer()
-
-			close(stop)
-			peak := <-result
-			b.ReportMetric(float64(peak)/(1<<20), "peakMB")
-			b.ReportMetric(float64(peak-baseline.HeapAlloc)/(1<<20), "deltaMB")
+			reportPeakHeap(b, func() {
+				for i := 0; i < b.N; i++ {
+					row.RSN = int64(i)
+					_ = w.Append(&row)
+				}
+				_ = w.Close()
+			})
 		})
 	}
 }
@@ -76,7 +59,7 @@ func TestStreamingHugeRoll(t *testing.T) {
 	row := Row{Key: "k", Payload: []byte("p"), Time: time.Now()}
 	for i := 0; i < n; i++ {
 		row.RSN = int64(i)
-		if err := w.Append(row); err != nil {
+		if err := w.Append(&row); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -86,21 +69,12 @@ func TestStreamingHugeRoll(t *testing.T) {
 
 	var files int
 	var rows int64
-	_ = filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() || !strings.HasSuffix(p, ".parquet") {
-			return err
-		}
+	eachParquet(t, dir, func(p string, rdr *file.Reader) {
 		files++
-		rdr, e := file.OpenParquetFile(p, false)
-		if e != nil {
-			t.Fatal(e)
-		}
-		defer rdr.Close()
 		rows += rdr.NumRows()
 		if got := rdr.NumRowGroups(); got < 20 {
 			t.Errorf("expected many row groups in one object, got %d", got)
 		}
-		return nil
 	})
 	if files != 1 {
 		t.Fatalf("expected exactly 1 object, got %d", files)

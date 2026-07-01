@@ -94,7 +94,7 @@ func BenchmarkCodec(b *testing.B) {
 
 				stop := make(chan struct{})
 				pk := make(chan uint64, 1)
-				go func() { pk <- samplePeakInuse(stop) }()
+				go func() { pk <- samplePeakHeap(stop) }()
 
 				var outBytes int64
 				b.ResetTimer()
@@ -107,7 +107,7 @@ func BenchmarkCodec(b *testing.B) {
 						b.Fatal(err)
 					}
 					for j := range corpus {
-						if err := w.Append(corpus[j]); err != nil {
+						if err := w.Append(&corpus[j]); err != nil {
 							b.Fatal(err)
 						}
 					}

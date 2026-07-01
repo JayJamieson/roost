@@ -32,7 +32,6 @@ var metricRoostSchema = arrow.NewSchema([]arrow.Field{
 type MetricRoostAppender struct{}
 
 var _ roost.RowAppender[Metric] = MetricRoostAppender{}
-var _ roost.PartitionAppender[Metric] = MetricRoostAppender{}
 
 func (MetricRoostAppender) Schema() *arrow.Schema { return metricRoostSchema }
 
