@@ -23,12 +23,12 @@ func Example() {
 
 	// Reflection: zero setup, works on any struct immediately.
 	wr, _ := roost.NewWriter[codegen.Metric](ctx, sink, roost.WithCodec("zstd"))
-	_ = wr.Append(codegen.Metric{TS: time.Unix(0, 0), Host: "h1", CPU: 0.4, Region: "us-east-1"})
+	_ = wr.Append(&codegen.Metric{TS: time.Unix(0, 0), Host: "h1", CPU: 0.4, Region: "us-east-1"})
 	_ = wr.Close()
 
 	// Generated: zero reflection, identical surface.
 	wg, _ := roost.NewWriterFor[codegen.Metric](ctx, sink, codegen.MetricRoostAppender{}, roost.WithCodec("zstd"))
-	_ = wg.Append(codegen.Metric{TS: time.Unix(0, 0), Host: "h1", CPU: 0.4, Region: "us-east-1"})
+	_ = wg.Append(&codegen.Metric{TS: time.Unix(0, 0), Host: "h1", CPU: 0.4, Region: "us-east-1"})
 	_ = wg.Close()
 
 	fmt.Println("ok")

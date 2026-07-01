@@ -3,7 +3,6 @@ package roost_test
 import (
 	"context"
 	"fmt"
-	"io/fs"
 	"path/filepath"
 	"reflect"
 	"sort"
@@ -142,7 +141,7 @@ func writeCorpus(t *testing.T, rows []codegen.Metric, gen bool) string {
 		t.Fatal(err)
 	}
 	for _, r := range rows {
-		if err := w.Append(r); err != nil {
+		if err := w.Append(&r); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -156,29 +155,16 @@ func writeCorpus(t *testing.T, rows []codegen.Metric, gen bool) string {
 // schema (reduced), all decoded rows, and the sorted set of Hive partition dirs.
 func readAllParquet(t *testing.T, dir string) ([]fieldInfo, []decodedRow, []string) {
 	t.Helper()
-	var paths []string
-	_ = filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
-		if err == nil && !d.IsDir() && strings.HasSuffix(p, ".parquet") {
-			paths = append(paths, p)
-		}
-		return nil
-	})
-	sort.Strings(paths)
-
 	var schema []fieldInfo
 	var rows []decodedRow
 	partSet := map[string]struct{}{}
 
-	for _, p := range paths {
+	eachParquet(t, dir, func(p string, f *file.Reader) {
 		rel, _ := filepath.Rel(dir, p)
 		partDir := filepath.ToSlash(filepath.Dir(rel))
 		partSet[partDir] = struct{}{}
 		region := regionFromPath(partDir)
 
-		f, err := file.OpenParquetFile(p, false)
-		if err != nil {
-			t.Fatalf("open %s: %v", p, err)
-		}
 		rdr, err := pqarrow.NewFileReader(f, pqarrow.ArrowReadProperties{}, memory.DefaultAllocator)
 		if err != nil {
 			t.Fatalf("reader %s: %v", p, err)
@@ -204,8 +190,7 @@ func readAllParquet(t *testing.T, dir string) ([]fieldInfo, []decodedRow, []stri
 			})
 		}
 		tbl.Release()
-		f.Close()
-	}
+	})
 
 	parts := make([]string, 0, len(partSet))
 	for k := range partSet {

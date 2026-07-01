@@ -25,10 +25,8 @@ type Writer[T any] struct {
 	enc     Encoder
 	mem     memory.Allocator
 	app     RowAppender[T]
-	partApp PartitionAppender[T] // non-nil when app builds keys into a buffer
-	scratch []byte               // reused partition-key buffer (guarded by mu)
-	schema  *arrow.Schema        // == app.Schema(), cached
-	tPtr    bool                 // T is a pointer type; needs a per-row nil guard
+	scratch []byte        // reused partition-key buffer (guarded by mu)
+	schema  *arrow.Schema // == app.Schema(), cached
 	cfg     config
 	runID   int64
 
@@ -115,20 +113,13 @@ func newWriter[T any](ctx context.Context, sink Sink, app RowAppender[T], schema
 	w := &Writer[T]{
 		ctx: ctx, sink: sink, mem: memory.DefaultAllocator,
 		app: app, schema: schema, cfg: cfg,
-		tPtr:  reflect.TypeOf((*T)(nil)).Elem().Kind() == reflect.Pointer,
 		runID: time.Now().UnixNano(), parts: make(map[string]*partState),
-	}
-	// Opt into the zero-allocation partition-key path when the appender supports
-	// it (roostgen emits PartitionInto for partitioned types).
-	if pa, ok := app.(PartitionAppender[T]); ok {
-		w.partApp = pa
 	}
 	if cfg.encoder != nil {
 		w.enc = cfg.encoder
 	} else {
 		w.enc = NewPqarrowEncoder(cfg.codec, cfg.rowGroupRows,
-			PqarrowDictionaryColumns(unionDictCols(tagDictCols, cfg.dictColumns)...),
-			PqarrowCompressionLevel(cfg.codecLevel))
+			unionDictCols(tagDictCols, cfg.dictColumns), cfg.codecLevel)
 	}
 	// A fixed pool of n encode workers runs compression + upload off w.mu. Even
 	// at concurrency 1 the single worker pipelines encoding with Append. The
@@ -147,25 +138,13 @@ func newWriter[T any](ctx context.Context, sink Sink, app RowAppender[T], schema
 	return w
 }
 
-// Append writes one record by value. It delegates to AppendPtr; because it
-// takes the address of its value parameter, that row escapes to the heap (one
-// allocation per call). Hot paths that want to avoid it should reuse a row
-// buffer and call AppendPtr.
-func (w *Writer[T]) Append(v T) error { return w.AppendPtr(&v) }
-
-// AppendPtr writes one record through a pointer. A caller that reuses a single
-// row buffer across calls pays no per-row heap copy - the pointer's escape is
-// hoisted out of the caller's loop - unlike Append(v T), which copies its value
-// parameter to the heap every call. The Writer reads *v synchronously under its
-// lock and never retains it, so reusing the buffer between calls is safe. v must
-// be non-nil.
-func (w *Writer[T]) AppendPtr(v *T) error {
+// Append writes one record through a pointer. A caller that reuses a single row
+// buffer across calls pays no per-row heap copy: the pointer's escape is hoisted
+// out of the caller's loop. The Writer reads *v synchronously under its lock and
+// never retains it, so reusing the buffer between calls is safe. v must be
+// non-nil.
+func (w *Writer[T]) Append(v *T) error {
 	if v == nil {
-		return errNil
-	}
-	// Only pointer-typed T needs the nil guard, and only then do we pay for a
-	// reflect call; value structs (and all generated appenders) skip it entirely.
-	if w.tPtr && nilPointer(*v) {
 		return errNil
 	}
 	w.mu.Lock()
@@ -192,8 +171,6 @@ func (w *Writer[T]) AppendPtr(v *T) error {
 		}
 	}
 	if ps.objRows >= w.cfg.rollRows || (w.cfg.rollBytes > 0 && ps.objBytes >= w.cfg.rollBytes) {
-		// fmt.Printf("ps.objRows: %d >= w.cfg.rollRows: %d || w.cfg.rollBytes: %d > ps.objBytes: %d > w.cfg.rollBytes: %d \n", ps.objRows, w.cfg.rollRows, w.cfg.rollBytes, ps.objBytes, w.cfg.rollBytes)
-		// fmt.Printf("%v, %v\n", ps.objRows >= w.cfg.rollRows, w.cfg.rollBytes > 0 && ps.objBytes >= w.cfg.rollBytes)
 		return w.finalizeLocked(ps)
 	}
 	return nil
@@ -201,32 +178,19 @@ func (w *Writer[T]) AppendPtr(v *T) error {
 
 // partitionFor locates (or opens) the partState for v. Caller holds w.mu.
 //
-// With a PartitionAppender it builds the key into the reused scratch buffer and
-// looks it up via map[string(scratch)], which the compiler resolves without
+// It builds the key into the reused scratch buffer via PartitionInto and looks
+// it up via map[string(scratch)], which the compiler resolves without
 // allocating; a fresh key string is materialized only when a new partition is
-// opened. Without one it falls back to Partition(v)'s freshly allocated string.
+// opened.
 func (w *Writer[T]) partitionFor(v *T) (*partState, error) {
-	if w.partApp != nil {
-		w.scratch = w.partApp.PartitionInto(v, w.scratch[:0])
-		if ps := w.parts[string(w.scratch)]; ps != nil { // no allocation
-			return ps, nil
-		}
-		if err := w.evictIfNeeded(); err != nil {
-			return nil, err
-		}
-		key := string(w.scratch) // materialize only for a new partition
-		ps := &partState{pathSeg: key, buf: newRecordBuf(w.mem, w.schema)}
-		w.parts[key] = ps
-		return ps, nil
-	}
-
-	key := w.app.Partition(v)
-	if ps := w.parts[key]; ps != nil {
+	w.scratch = w.app.PartitionInto(v, w.scratch[:0])
+	if ps := w.parts[string(w.scratch)]; ps != nil { // no allocation
 		return ps, nil
 	}
 	if err := w.evictIfNeeded(); err != nil {
 		return nil, err
 	}
+	key := string(w.scratch) // materialize only for a new partition
 	ps := &partState{pathSeg: key, buf: newRecordBuf(w.mem, w.schema)}
 	w.parts[key] = ps
 	return ps, nil
@@ -377,20 +341,6 @@ func (w *Writer[T]) evictIfNeeded() error {
 	err := w.finalizeLocked(ps)
 	ps.buf.release()
 	return err
-}
-
-// nilPointer reports whether v is (or dereferences through) a nil pointer. It
-// is only called for pointer-typed T, preserving NewWriter's prior contract
-// that appending a nil pointer is an error; value structs never reach it.
-func nilPointer[T any](v T) bool {
-	rv := reflect.ValueOf(v)
-	for rv.Kind() == reflect.Pointer {
-		if rv.IsNil() {
-			return true
-		}
-		rv = rv.Elem()
-	}
-	return false
 }
 
 // unionDictCols merges the tag-derived and option-derived dictionary column

@@ -54,8 +54,9 @@ func TestBuildPlanRejectsNonStruct(t *testing.T) {
 
 func TestPartitionPath(t *testing.T) {
 	pl, _ := buildPlan(reflect.TypeOf(Event{}))
-	rv := reflect.ValueOf(Event{Region: "us east/1"})
-	got := partitionPath(rv, pl.partCols)
+	a := reflectAppender[Event]{pl: pl}
+	e := Event{Region: "us east/1"}
+	got := string(a.PartitionInto(&e, nil))
 	if got != "region=us_east_1" {
 		t.Fatalf("path = %q, want region=us_east_1 (sanitized)", got)
 	}

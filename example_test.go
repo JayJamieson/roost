@@ -35,7 +35,7 @@ func ExampleWriter() {
 		log.Fatal(err)
 	}
 	for i := 0; i < 1000; i++ {
-		if err := w.Append(Metric{TS: time.Now(), Host: "h1", CPU: 0.42, Region: "us-east-1"}); err != nil {
+		if err := w.Append(&Metric{TS: time.Now(), Host: "h1", CPU: 0.42, Region: "us-east-1"}); err != nil {
 			log.Fatal(err)
 		}
 	}
@@ -59,7 +59,7 @@ func ExampleWriter_partitioned() {
 	sink, _ := local.New(dir)
 	w, _ := roost.NewWriter[Metric](context.Background(), sink, roost.WithRollRows(1_000_000))
 	for _, r := range []string{"us-east-1", "eu-west-1", "ap-southeast-2"} {
-		_ = w.Append(Metric{TS: time.Now(), Host: "h", CPU: 1, Region: r})
+		_ = w.Append(&Metric{TS: time.Now(), Host: "h", CPU: 1, Region: r})
 	}
 	_ = w.Close()
 	fmt.Println(w.Stats().Objects) // one finalized object per region
@@ -78,7 +78,7 @@ func ExampleWriter_withEncodeConcurrency() {
 		roost.WithEncodeConcurrency(4),
 	)
 	for i := 0; i < 40_000; i++ {
-		_ = w.Append(Metric{TS: time.Now(), Host: "h", CPU: 1, Region: "r"})
+		_ = w.Append(&Metric{TS: time.Now(), Host: "h", CPU: 1, Region: "r"})
 	}
 	_ = w.Close()
 	fmt.Println(w.Stats().Rows)

@@ -34,7 +34,7 @@ func main() {
 		log.Fatal(err)
 	}
 	for i := 0; i < 100_000; i++ {
-		_ = w.Append(Row{ID: int64(i), Time: time.Now(), Body: []byte("x")})
+		_ = w.Append(&Row{ID: int64(i), Time: time.Now(), Body: []byte("x")})
 	}
 	if err := w.Close(); err != nil {
 		log.Fatal(err)

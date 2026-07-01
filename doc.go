@@ -30,11 +30,10 @@
 // Both produce byte-equivalent Parquet; the generated path trades a build step
 // for fewer per-row allocations on hot ingest paths. See examples/codegen.
 //
-// Append(v T) copies its argument to the heap (one allocation per row). Hot
-// paths can reuse a row buffer and call AppendPtr(*T) to avoid that copy; for
-// partitioned generated types roostgen also emits a PartitionInto method that
-// lets the Writer build partition keys into a reused buffer, so AppendPtr into
-// already-open partitions appends with zero allocations.
+// Append takes *T so a hot path can reuse one row buffer across calls and pay no
+// per-row heap copy. For partitioned generated types roostgen also emits a
+// PartitionInto method that lets the Writer build partition keys into a reused
+// buffer, so appending into already-open partitions allocates nothing.
 //
 // # Dictionary encoding
 //

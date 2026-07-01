@@ -2,8 +2,6 @@ package roost_test
 
 import (
 	"context"
-	"io/fs"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -27,15 +25,7 @@ type DictRow struct {
 func columnEncodings(t *testing.T, dir string) map[string][]parquet.Encoding {
 	t.Helper()
 	out := map[string][]parquet.Encoding{}
-	err := filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() || !strings.HasSuffix(p, ".parquet") {
-			return err
-		}
-		rdr, e := file.OpenParquetFile(p, false)
-		if e != nil {
-			t.Fatal(e)
-		}
-		defer rdr.Close()
+	eachParquet(t, dir, func(p string, rdr *file.Reader) {
 		md := rdr.MetaData()
 		for rg := 0; rg < md.NumRowGroups(); rg++ {
 			rgMeta := md.RowGroup(rg)
@@ -48,11 +38,7 @@ func columnEncodings(t *testing.T, dir string) map[string][]parquet.Encoding {
 				out[name] = append(out[name], cc.Encodings()...)
 			}
 		}
-		return nil
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
 	return out
 }
 
@@ -81,7 +67,7 @@ func TestDictionaryOptIn(t *testing.T) {
 	cats := []string{"a", "b", "c"} // low cardinality so dictionary engages
 	for i := 0; i < 3000; i++ {
 		v := cats[i%3]
-		if err := w.Append(DictRow{Tagged: v, Optioned: v, Plain: v}); err != nil {
+		if err := w.Append(&DictRow{Tagged: v, Optioned: v, Plain: v}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -118,7 +104,7 @@ func TestDictionaryTagAndOptionUnion(t *testing.T) {
 	}
 	cats := []string{"a", "b", "c"}
 	for i := 0; i < 1500; i++ {
-		if err := w.Append(DictRow{Tagged: cats[i%3], Optioned: cats[i%3], Plain: cats[i%3]}); err != nil {
+		if err := w.Append(&DictRow{Tagged: cats[i%3], Optioned: cats[i%3], Plain: cats[i%3]}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -149,7 +135,7 @@ func TestCompressionLevelHonored(t *testing.T) {
 		// Repetitive-but-not-trivial data so a higher level wins on ratio.
 		for i := 0; i < 50_000; i++ {
 			v := strings.Repeat("abcdefgh", (i%7)+1)
-			if err := w.Append(DictRow{Tagged: v, Optioned: v, Plain: v}); err != nil {
+			if err := w.Append(&DictRow{Tagged: v, Optioned: v, Plain: v}); err != nil {
 				t.Fatal(err)
 			}
 		}

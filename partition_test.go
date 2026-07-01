@@ -31,15 +31,11 @@ func TestAppendSanitizedMatchesSanitizeSegment(t *testing.T) {
 // same Hive layout as Partition.
 func TestPartitionIntoMatchesPartition(t *testing.T) {
 	app := codegen.MetricRoostAppender{}
-	pa, ok := any(app).(roost.PartitionAppender[codegen.Metric])
-	if !ok {
-		t.Fatal("MetricRoostAppender does not implement roost.PartitionAppender")
-	}
 	regions := []string{"us-east-1", "a/b=c d", "", "ünïcödé", `q"o'te`}
 	for _, r := range regions {
 		m := codegen.Metric{Region: r}
 		want := app.Partition(&m)
-		if got := string(pa.PartitionInto(&m, nil)); got != want {
+		if got := string(app.PartitionInto(&m, nil)); got != want {
 			t.Errorf("PartitionInto for region %q = %q, want %q", r, got, want)
 		}
 	}

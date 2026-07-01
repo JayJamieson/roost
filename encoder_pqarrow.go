@@ -19,41 +19,20 @@ type pqEncoder struct{ props *parquet.WriterProperties }
 // Dictionary encoding is off by default and enabled only for the columns in
 // dictCols (see WithDictionaryColumns and the `dict` struct tag), so
 // high-cardinality columns don't pay for a dictionary that never compresses.
-func NewPqarrowEncoder(codec string, rowGroupRows int64, opts ...PqarrowOption) Encoder {
-	var c pqConfig
-	for _, o := range opts {
-		o(&c)
-	}
+// level is the codec compression level; 0 means the codec default.
+func NewPqarrowEncoder(codec string, rowGroupRows int64, dictCols []string, level int) Encoder {
 	props := []parquet.WriterProperty{
 		parquet.WithCompression(pqCodec(codec)),
 		parquet.WithMaxRowGroupLength(rowGroupRows),
 		parquet.WithDictionaryDefault(false),
 	}
-	if c.level != 0 {
-		props = append(props, parquet.WithCompressionLevel(c.level))
+	if level != 0 {
+		props = append(props, parquet.WithCompressionLevel(level))
 	}
-	for _, col := range c.dictCols {
+	for _, col := range dictCols {
 		props = append(props, parquet.WithDictionaryFor(col, true))
 	}
 	return &pqEncoder{props: parquet.NewWriterProperties(props...)}
-}
-
-// PqarrowOption configures the default pqarrow encoder.
-type PqarrowOption func(*pqConfig)
-
-type pqConfig struct {
-	dictCols []string
-	level    int
-}
-
-// WithDictionaryFor enables dictionary encoding for the named columns.
-func PqarrowDictionaryColumns(cols ...string) PqarrowOption {
-	return func(c *pqConfig) { c.dictCols = append(c.dictCols, cols...) }
-}
-
-// PqarrowCompressionLevel sets the codec compression level (0 = codec default).
-func PqarrowCompressionLevel(level int) PqarrowOption {
-	return func(c *pqConfig) { c.level = level }
 }
 
 func (e *pqEncoder) Open(_ context.Context, dst io.Writer, schema *arrow.Schema) (ObjectEncoder, error) {
