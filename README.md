@@ -24,32 +24,14 @@ w, _ := roost.NewWriter[Event](ctx, sink,
     roost.WithEncodeConcurrency(4),
 )
 for ev := range stream {
-    w.Append(ev)
+    w.Append(&ev)
 }
 w.Close()
 ```
 
-## Layout
-
-- `roost` - `Writer[T]`, options, `Sink`/`Encoder` interfaces, pqarrow encoder.
-- `roost/sink/local` - filesystem sink (optional fsync).
-- `roost/sink/s3` - S3 / R2 sink: single PutObject per object, spill-to-file,
-  optional bandwidth limit. No multipart by design.
-- `roost/limit` - byte-rate token bucket + io wrappers.
-- DuckDB encoder lives in the core package behind build tag `duckdb`.
-
-## Two encoders - pick per environment
-
-| | pqarrow (default) | duckdb (`-tags duckdb`) |
-|---|---|---|
-| Dependency | pure Go, cross-compiles | CGO + libduckdb |
-| Raw single-file speed | good | ~40% faster |
-| Concurrency | file/segment fan-out (`WithEncodeConcurrency`) | internal C++ threads |
-| Memory | on-heap, measurable | off-heap (C++) |
-| In-write transforms | none (passthrough) | SQL (sort/cluster/aggregate) |
-| Use when | embedded, serverless, no-CGO, objwal | DuckDB already in stack, need transforms |
-
-Same `Writer[T]` surface either way; swap via `WithEncoder(roost.NewDuckDBEncoder(...))`.
+`Append` takes `*T` and reads it synchronously without ever retaining it, so you
+can reuse a single row buffer across calls; a steady stream into already-open
+partitions then appends with zero allocations.
 
 ## Code generation (optional, zero-reflection)
 
@@ -81,62 +63,62 @@ switching is just changing the constructor. Regenerate when the struct changes
 (same discipline as easyjson/sqlc). See `examples/codegen` for a worked setup
 with a checked-in generated file.
 
-| | Reflection - `NewWriter` | Codegen - `NewWriterFor` + `roostgen` |
-|---|---|---|
-| Setup | none; works on any struct immediately | `go generate`; regenerate on struct change |
-| Allocs/row | higher (struct + `time.Time` boxing) | 1 via `Append`, 0 via `AppendPtr` |
-| Hot-path ns/row | reflect overhead | direct field access |
-| Type safety | runtime errors from the plan | compile-time (`var _ RowAppender[T]`) |
-| Schema visibility | implicit | explicit in generated file |
-| Moving parts | one code path | extra generated file + build-time generator dep |
-| Supported types | bool, ints, uints, floats, string, `[]byte`, `time.Time`, pointers | the same set |
-| Best for | prototyping, moderate throughput, changing schemas | hot ingest on stable schemas |
-
-### Squeezing out the last allocations
-
-`Append(v T)` copies its argument to the heap (one alloc/row) because it takes
-the address of the value parameter. To remove it, reuse a row buffer and call
-`AppendPtr` - the escape then hoists out of your loop:
-
-```go
-row := Metric{Region: "us-east-1"}
-for ev := range stream {
-    row.TS, row.Host, row.CPU = ev.TS, ev.Host, ev.CPU // refill in place
-    w.AppendPtr(&row)
-}
-```
-
-For partitioned types, `roostgen` also emits `PartitionInto`, which the Writer
-uses to build the partition key into a reused buffer instead of allocating a
-fresh string per row. Combined with `AppendPtr`, a steady stream into open
-partitions appends with **zero allocations**.
-
-Append hot path, partitioned `Metric` with a `time.Time`, no roll (Apple M5):
-
-```
-BenchmarkAppendReflection-10     186 ns/op    4 allocs/op   // NewWriter, reflection
-BenchmarkAppendGenerated-10       99 ns/op    1 allocs/op   // NewWriterFor, Append(v T)
-BenchmarkAppendGeneratedPtr-10    80 ns/op    0 allocs/op   // NewWriterFor, AppendPtr(&row) reused
-```
-
 ## Performance
 
+Apple M5, pqarrow encoder, zstd. Append hot path (partitioned `Metric` with a
+`time.Time`, no roll):
+
 ```
-goos: darwin
-goarch: arm64
-pkg: github.com/jayjamieson/roost
-cpu: Apple M5
-BenchmarkAppend-10                               4722384               251.0 ns/op          2019 B/op          8 allocs/op
-BenchmarkAppendAndRoll-10                        3871932               317.8 ns/op        327.22 MB/s        3867 B/op          8 allocs/op
-BenchmarkRollConcurrency/workers=1-10            1147006               1031 ns/op         100.87 MB/s        3855 B/op          8 allocs/op
-BenchmarkRollConcurrency/workers=4-10            4402430               247.5 ns/op        420.29 MB/s        3874 B/op          8 allocs/op
-BenchmarkRollConcurrency/workers=16-10          11206383               104.8 ns/op        991.92 MB/s        3855 B/op          8 allocs/op
-BenchmarkRollConcurrency/workers=32-10          11164981               110.3 ns/op        942.71 MB/s        3853 B/op          8 allocs/op
-BenchmarkRollConcurrencyMem/workers=1-10         1180226               996.5 ns/op              89.01 deltaMB           90.00 peakMB        3893 B/op        8 allocs/op
-BenchmarkRollConcurrencyMem/workers=4-10         4608975               231.9 ns/op             346.7 deltaMB           347.7 peakMB         3869 B/op        8 allocs/op
-BenchmarkRollConcurrencyMem/workers=16-10        9727112               123.9 ns/op             205.2 deltaMB           206.2 peakMB         3852 B/op        8 allocs/op
-BenchmarkRollConcurrencyMem/workers=32-10        9677396               126.5 ns/op             224.7 deltaMB           225.8 peakMB         3852 B/op        8 allocs/op
+BenchmarkAppendReflection-10    176 ns/op    1 allocs/op   // NewWriter, reflection
+BenchmarkAppendGenerated-10     118 ns/op    0 allocs/op   // NewWriterFor, reused &row
 ```
+
+`WithEncodeConcurrency` overlaps compression + upload across objects. Measured
+against a sink with 30 ms/object upload latency (models an R2 `PutObject`), rows
+~104 B:
+
+```mermaid
+xychart-beta
+    title "Throughput scales with encode workers"
+    x-axis "encode workers" [1, 4, 16, 32]
+    y-axis "MB/s" 0 --> 1300
+    bar [126, 553, 1144, 1156]
+    line [126, 553, 1144, 1156]
+```
+
+Throughput scales ~9x from 1 to 16 workers (1.2 -> 11 M rows/s), then plateaus
+once it is encode-bound. Peak heap tracks the row groups held in flight while
+uploads drain - not the worker count - so it stays bounded as concurrency rises:
+
+```mermaid
+xychart-beta
+    title "Peak heap stays bounded as workers scale"
+    x-axis "encode workers" [1, 4, 16, 32]
+    y-axis "peak heap MB" 0 --> 600
+    bar [440, 390, 460, 490]
+```
+
+| workers | throughput | records/s | peak heap |
+|--------:|-----------:|----------:|----------:|
+| 1  | 126 MB/s  | 1.2 M/s  | ~440 MB |
+| 4  | 553 MB/s  | 5.3 M/s  | ~390 MB |
+| 16 | 1144 MB/s | 11.0 M/s | ~460 MB |
+| 32 | 1156 MB/s | 11.1 M/s | ~490 MB |
+
+Peak heap is GC-dependent and noisy (±40 MB run-to-run); the point is that it is
+bounded, not that it scales. Reproduce with `go test -bench RollConcurrency -benchmem`.
+
+Resident memory is bounded by the row group, not the object: the Writer streams
+each filled row group to the encoder and releases it, so a 1 KB roll and a 1 GB
+roll hold the same working set (`BenchmarkStreamingMem`).
+
+## Encoders
+
+The default `pqarrow` encoder is pure Go and cross-compiles (no CGO). A DuckDB
+encoder lives behind the `duckdb` build tag (CGO + libduckdb) for stacks already
+running DuckDB or needing SQL transforms (sort/cluster/aggregate) on write. The
+`Writer[T]` surface is identical; swap via
+`WithEncoder(roost.NewDuckDBEncoder(...))`.
 
 ## S3/R2 sink: single PUT, no multipart
 
